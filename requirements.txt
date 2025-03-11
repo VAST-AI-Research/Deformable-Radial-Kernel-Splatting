@@ -1,0 +1,15 @@
+torch==2.2.2 --index-url https://download.pytorch.org/whl/cu118
+plyfile==0.8.1
+numpy<2
+tqdm
+imageio==2.27.0
+opencv-python
+imageio-ffmpeg
+scipy
+lpips
+einops
+matplotlib
+dearpygui
+piq
+tensorboard
+torchvision==0.17.2
