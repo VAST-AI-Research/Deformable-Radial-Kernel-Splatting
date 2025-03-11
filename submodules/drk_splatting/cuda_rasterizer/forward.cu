@@ -475,7 +475,7 @@ renderCUDA(
 			float dir_dot_n = Rs[2] * dir[0] + Rs[5] * dir[1] + Rs[8] * dir[2];
 			// Truncate to avoid inconsistency
 			const float float_accuracy_scale = 1e7;
-	        const float dir_dot_n_abs = roundf(fabsf(dir_dot_n) * float_accuracy_scale) / float_accuracy_scale;
+			const float dir_dot_n_abs = roundf(fabsf(dir_dot_n) * float_accuracy_scale) / float_accuracy_scale;
 			dir_dot_n = copysignf(dir_dot_n_abs, dir_dot_n);
 			float ray_t = collected_op_n[j] / dir_dot_n;
 			if (fabsf(dir_dot_n) < 0.0001f)
