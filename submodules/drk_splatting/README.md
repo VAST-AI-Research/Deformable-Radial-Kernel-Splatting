@@ -1,9 +1,6 @@
-# Learnable Kernel Rasterization
-
-2D Surfel Splatting with Learnable Spatial Kernels
-
+# Deformable Radial Kernel Splatting
 
 <div align="center">
-  <img src="./assets/LK_Demo.gif" width="100%">
+  <img src="./assets/DRK-Parameters.gif" width="100%">
 </div>
 
