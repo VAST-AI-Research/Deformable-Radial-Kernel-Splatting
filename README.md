@@ -45,13 +45,18 @@ source drkenv/bin/activate
 
 ### Install Dependencies
 ```bash
-pip install -r requirements.txt
+python -m pip install -U pip setuptools wheel importlib-metadata
+python -m pip install -r requirements.txt
+
+# Use the CUDA toolkit that matches the PyTorch wheels above.
+source ./switch-cuda.sh 11.8
+
 cd submodules/depth-diff-gaussian-rasterization
-python setup.py install && pip install .
+python -m pip install --no-build-isolation --no-deps .
 cd ../drk_splatting
-python setup.py install && pip install .
+python -m pip install --no-build-isolation --no-deps .
 cd ../simple-knn
-python setup.py install && pip install .
+python -m pip install --no-build-isolation --no-deps .
 cd ../..
 ```
 

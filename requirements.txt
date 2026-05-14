@@ -1,4 +1,6 @@
-torch==2.2.2 --index-url https://download.pytorch.org/whl/cu118
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.2.2+cu118
+torchvision==0.17.2+cu118
 plyfile==0.8.1
 numpy<2
 tqdm
@@ -12,4 +14,3 @@ matplotlib
 dearpygui
 piq
 tensorboard
-torchvision==0.17.2

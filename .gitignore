@@ -1,0 +1,2 @@
+submodules/*/build/
+submodules/*/*.egg-info/
