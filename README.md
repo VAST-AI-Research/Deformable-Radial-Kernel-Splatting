@@ -134,14 +134,12 @@ python ./scripts/mip360_script.py   # For MipNeRF-360
 
 ## Recent Optimizations
 
-### CUDA Rasterization Overhaul
+### CUDA Optimization
 - **Precomputed kernel vectors**: `scale * [cos(θ), sin(θ)]` computed once in preprocess, reused in rendering and tile culling
 - **`atan2f` replaces `acos+sqrt`**: faster angle computation in inner loop
 - **Removed `roundf` truncation**: eliminated expensive per-hit rounding
 - **Shared memory optimization**: geometry buffer strategy to stay within 48KB limit
 - **Densification stats via CUDA**: collect absolute gradients (`fabsf`) directly in backward kernel, avoiding Python overhead
-
-### CUDA Performance (Round 2)
 - **Branchless segment search**: replaced branch-heavy linear scan with predicated additions for better warp coherence
 - **Fast math intrinsics**: `__expf`, `__cosf`, `__sincosf`, `__frcp_rn` to replace standard `exp`/`cos`/`sin`/division
 - **Cached reciprocals**: pre-compute `1/delta`, `1/(scale²)`, `1/(theta_r−theta_l)`, `1/dir_dot_n` etc. to eliminate redundant divisions
