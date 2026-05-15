@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -22,8 +22,8 @@ __device__ __constant__ float pi = 3.14159265358979323846f;
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
 {
-	// The implementation is loosely based on code for 
-	// "Differentiable Point-Based Radiance Fields for 
+	// The implementation is loosely based on code for
+	// "Differentiable Point-Based Radiance Fields for
 	// Efficient View Synthesis" by Zhang et al. (2022)
 	glm::vec3 pos = means[idx];
 	glm::vec3 dir = pos - campos;
@@ -131,12 +131,12 @@ __global__ void preprocess2DCUDA(int P, int D, int M,
 	const float* shs,
 	bool* clamped,
 	const float* colors_precomp,
-	const float* viewmatrix,
+		const float* viewmatrix,
 	const float* projmatrix,
 	const float* cam_pos,
 	const int W, int H,
 	const float tan_fovx, float tan_fovy,
-	const float focal_x, float focal_y,
+		const float focal_x, float focal_y,
 	int* radii,
 	float2* points_xy_image,
 	float* depths,
@@ -148,6 +148,8 @@ __global__ void preprocess2DCUDA(int P, int D, int M,
 	float * op_tu,
 	float * op_tv,
 	float * op_n,
+	float * op_cos_n,
+	float2 * kernel_vecs,
 
 	bool prefiltered,
 	bool tile_culling
@@ -170,6 +172,15 @@ __global__ void preprocess2DCUDA(int P, int D, int M,
 	scales = scales + idx * KERNEL_K;
 	thetas = thetas + idx * KERNEL_K;
 	Rs = Rs + idx * 9;
+	float2 local_kernel_vecs[KERNEL_K];
+	for(int ii=0; ii<KERNEL_K; ii++) {
+		float theta = ii==0? 0: thetas[ii-1];
+		const float angle = theta * 2.f * PI;
+		float s, c;
+		sincosf(angle, &s, &c);
+		local_kernel_vecs[ii] = {c * scales[ii], s * scales[ii]};
+		kernel_vecs[idx * KERNEL_K + ii] = local_kernel_vecs[ii];
+	}
 
 	// Transform point by projecting
 	float3 p_orig = { means3D[3 * idx], means3D[3 * idx + 1], means3D[3 * idx + 2] };
@@ -233,15 +244,13 @@ __global__ void preprocess2DCUDA(int P, int D, int M,
 		float3 vert_center_world = {means3D[3 * idx + 0], means3D[3 * idx + 1], means3D[3 * idx + 2]};
 		float3 vert_center_view = transformPoint4x3(vert_center_world, viewmatrix);
 		for(int ii=0; ii<KERNEL_K; ii++) {
-			float scale = scales[ii];
-			float theta = ii==0? 0: thetas[ii-1];
-			float u = NEAREST_VERT_RADIUS * scale * cosf(theta * 2.f * PI);
-			float v = NEAREST_VERT_RADIUS * scale * sinf(theta * 2.f * PI);
+			float u = NEAREST_VERT_RADIUS * local_kernel_vecs[ii].x;
+			float v = NEAREST_VERT_RADIUS * local_kernel_vecs[ii].y;
 			float3 vert_world = {
-				means3D[3 * idx + 0] + u * Rs[0] + v * Rs[1], 
-				means3D[3 * idx + 1] + u * Rs[3] + v * Rs[4], 
+				means3D[3 * idx + 0] + u * Rs[0] + v * Rs[1],
+				means3D[3 * idx + 1] + u * Rs[3] + v * Rs[4],
 				means3D[3 * idx + 2] + u * Rs[6] + v * Rs[7]};
-			
+
 			float3 vert_view = transformPoint4x3(vert_world, viewmatrix);
 			adjustVertView(vert_center_view, vert_view);
 			float safe_z = copysignf(0.0000001f + fabsf(vert_view.z), vert_view.z);
@@ -277,13 +286,15 @@ __global__ void preprocess2DCUDA(int P, int D, int M,
 	op_tu[idx] = op[idx_op] * Rs[0] + op[idx_op+1] * Rs[3] + op[idx_op+2] * Rs[6];
 	op_tv[idx] = op[idx_op] * Rs[1] + op[idx_op+1] * Rs[4] + op[idx_op+2] * Rs[7];
 	op_n[idx]  = op[idx_op] * Rs[2] + op[idx_op+1] * Rs[5] + op[idx_op+2] * Rs[8];
+	const float op_norm = sqrtf(max(op[idx_op] * op[idx_op] + op[idx_op + 1] * op[idx_op + 1] + op[idx_op + 2] * op[idx_op + 2], 0.0000001f));
+	op_cos_n[idx] = fabsf(op_n[idx] / op_norm);
 }
 
 
 // Main rasterization method. Collaboratively works on one tile per
-// block, each thread treats one pixel. Alternates between fetching 
+// block, each thread treats one pixel. Alternates between fetching
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, bool CACHE_SORT>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -300,23 +311,22 @@ renderCUDA(
 	const float* __restrict__ l1l2_rates,
 	const float* __restrict__ opacities,
 	const float* __restrict__ acutances,
-	const float* __restrict__ cam_pos,
-	const float focal_x, float focal_y,
-	const float* viewmatrix,
+		const float* __restrict__ cam_pos,
+		const float focal_x, float focal_y,
+		const float* viewmatrix,
 
-	const float* __restrict__ op,
 	const float* __restrict__ op_tu,
-	const float* __restrict__ op_tv,
-	const float* __restrict__ op_n,
-	
+		const float* __restrict__ op_tv,
+		const float* __restrict__ op_n,
+	const float* __restrict__ op_cos_n,
+	const float2* __restrict__ kernel_vecs,
+
 	float* __restrict__ final_alpha,
 	uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ bg_color,
-	float* __restrict__ out_color,
-	float* __restrict__ out_depth,
-	float* __restrict__ out_normal,
-
-	bool cache_sort)
+		const float* __restrict__ bg_color,
+		float* __restrict__ out_color,
+		float* __restrict__ out_depth,
+		float* __restrict__ out_normal)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -341,7 +351,6 @@ renderCUDA(
 	__shared__ int    collected_id      [BLOCK_SIZE];
 	__shared__ float2 collected_xy      [BLOCK_SIZE];
 
-	__shared__ float  collected_mean3D  [BLOCK_SIZE*3];
 	__shared__ float  collected_Rs      [BLOCK_SIZE*9];
 	__shared__ float  collected_opacity [BLOCK_SIZE];
 	__shared__ float  collected_acutance[BLOCK_SIZE];
@@ -349,7 +358,7 @@ renderCUDA(
 	__shared__ float  collected_op_tu   [BLOCK_SIZE];
 	__shared__ float  collected_op_tv   [BLOCK_SIZE];
 	__shared__ float  collected_op_n    [BLOCK_SIZE];
-	__shared__ float  collected_op      [BLOCK_SIZE*3];
+	__shared__ float  collected_op_cos_n[BLOCK_SIZE];
 	__shared__ float  collected_scales  [BLOCK_SIZE*KERNEL_K];
 	__shared__ float  collected_thetas  [BLOCK_SIZE*KERNEL_K];
 
@@ -362,8 +371,8 @@ renderCUDA(
 	float N[3] = {0.};
 
 	// CACHE Array to sort the surfels
-	float ray_t_array[CACHE_SIZE] = {0};
-	int js[CACHE_SIZE] = {0};
+	float ray_t_array[CACHE_SORT ? CACHE_SIZE : 1] = {0};
+	int js[CACHE_SORT ? CACHE_SIZE : 1] = {0};
 
 	// Pre-compute ray direction
 	glm::vec3 dir_camera = {(pixf.x - (W - 1.0) * 0.5) / focal_x, (pixf.y - (H - 1.0) * .5) / focal_y, 1.0f};
@@ -387,15 +396,15 @@ renderCUDA(
 
 		// Collectively fetch per-Gaussian data from global to shared
 		int progress = i * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y)
-		{
-			int coll_id = point_list[range.x + progress];
-			collected_id[block.thread_rank()] = coll_id;
+			if (range.x + progress < range.y)
+			{
+				int coll_id = point_list[range.x + progress];
+				if(coll_id >= 0 && opacities[coll_id] < 1.0f / 255.0f)
+					coll_id = -1;
+				collected_id[block.thread_rank()] = coll_id;
 
-			if(coll_id >= 0) {
+				if(coll_id >= 0) {
 				collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-				for (int i = 0; i < 3; i++)
-					collected_mean3D[i + 3 * block.thread_rank()] = means3D[coll_id * 3 + i];
 				for (int i = 0; i < 9; i++)
 					collected_Rs[i + 9 * block.thread_rank()] = rotations[coll_id * 9 + i];
 				collected_opacity[block.thread_rank()] = opacities[coll_id];
@@ -404,8 +413,7 @@ renderCUDA(
 				collected_op_tu[block.thread_rank()] = op_tu[coll_id];
 				collected_op_tv[block.thread_rank()] = op_tv[coll_id];
 				collected_op_n[block.thread_rank()] = op_n[coll_id];
-				for (int i = 0; i < 3; i++)
-					collected_op[i + 3 * block.thread_rank()] = op[coll_id * 3 + i];
+				collected_op_cos_n[block.thread_rank()] = op_cos_n[coll_id];
 				for (int i = 0; i < KERNEL_K; i++)
 					collected_scales[i + KERNEL_K * block.thread_rank()] = scales[coll_id * KERNEL_K + i];
 				for (int i = 0; i < KERNEL_K; i++)
@@ -415,12 +423,14 @@ renderCUDA(
 		block.sync();
 
 		// Initialize CACHE Array to sort the surfels
-		int next_array[CACHE_SIZE] = {0};
-		int prev_array[CACHE_SIZE] = {0};
-		for(int ii=0; ii<CACHE_SIZE; ii++) {
-			js[ii] = -1;
-			next_array[ii] = -1;
-			prev_array[ii] = -1;
+		int next_array[CACHE_SORT ? CACHE_SIZE : 1] = {0};
+		int prev_array[CACHE_SORT ? CACHE_SIZE : 1] = {0};
+		if(CACHE_SORT) {
+			for(int ii=0; ii<CACHE_SIZE; ii++) {
+				js[ii] = -1;
+				next_array[ii] = -1;
+				prev_array[ii] = -1;
+			}
 		}
 		int head = 0;
 		int tail = 0;
@@ -435,14 +445,13 @@ renderCUDA(
 			if(collected_id[jj] < 0) {
 				continue;
 			}
-			
+
 			int j = -1;
-			if(cache_sort) {
+			if(CACHE_SORT) {
 				// There are unprocessed surfels
 				if(jj < min(BLOCK_SIZE, toDo)) {
 					// Pre-calculate Intersection (dir, cam_pos -> uv)
 					const float * Rs = collected_Rs + jj * 9;
-					const float * mean3D = collected_mean3D + jj * 3;
 					const glm::vec3 normal = {Rs[2], Rs[5], Rs[8]};
 					float dir_dot_n = Rs[2] * dir[0] + Rs[5] * dir[1] + Rs[8] * dir[2];
 					float ray_t = collected_op_n[jj] / dir_dot_n;
@@ -464,19 +473,14 @@ renderCUDA(
 				continue;
 			float2 xy = collected_xy[j];
 
-			float opacity = opacities[collected_id[j]];
+			float opacity = collected_opacity[j];
 			if (opacity < 1.0f / 255.0f)
 				continue;
-			
+
 			// Step 1. Intersection (dir, cam_pos -> uv)
 			const float * Rs = collected_Rs + j * 9;
-			const float * mean3D = collected_mean3D + j * 3;
 			const glm::vec3 normal = {Rs[2], Rs[5], Rs[8]};
 			float dir_dot_n = Rs[2] * dir[0] + Rs[5] * dir[1] + Rs[8] * dir[2];
-			// Truncate to avoid inconsistency
-			const float float_accuracy_scale = 1e7;
-			const float dir_dot_n_abs = roundf(fabsf(dir_dot_n) * float_accuracy_scale) / float_accuracy_scale;
-			dir_dot_n = copysignf(dir_dot_n_abs, dir_dot_n);
 			float ray_t = collected_op_n[j] / dir_dot_n;
 			if (fabsf(dir_dot_n) < 0.0001f)
 				continue;
@@ -491,8 +495,8 @@ renderCUDA(
 			float uv_l2norm = uv.x * uv.x + uv.y * uv.y;
 			// Numerical Protection!
 			uv_l2norm = max(uv_l2norm, 0.00000001);
-			float theta = acos(uv.x / sqrt(uv_l2norm));
-			theta = uv.y > 0? theta: 2.0f*PI - theta;
+			float theta = atan2f(uv.y, uv.x);
+			theta = theta < 0.f? theta + 2.0f * PI: theta;
 			theta = min(theta / (2.0f * PI), 1.0f);
 			const float * thetas_array = collected_thetas + KERNEL_K*j;
 			int k = 0;
@@ -504,10 +508,11 @@ renderCUDA(
 			float rate = 0.5f * (cosf((1.0f - linear_rate) * PI) + 1);
 			float scale_left = scale[k];
 			float scale_right = k==(KERNEL_K-1)? scale[0]: scale[k+1];
-			
+
 			// Step 3. Affine transformation
-			float2 e1 = {cosf(theta_l * 2.0f * PI) * scale_left,  sinf(theta_l * 2.0f * PI) * scale_left};
-			float2 e2 = {cosf(theta_r * 2.0f * PI) * scale_right, sinf(theta_r * 2.0f * PI) * scale_right};
+			const float2 * kernel_vec = kernel_vecs + KERNEL_K*collected_id[j];
+			float2 e1 = kernel_vec[k];
+			float2 e2 = kernel_vec[k==(KERNEL_K-1)? 0: k+1];
 			float delta = e1.x * e2.y - e1.y * e2.x;
 			delta = copysignf(max(fabsf(delta), 0.0000001f), delta);
 			float2 uv_t = {(e2.y * uv.x - e2.x * uv.y) / delta, (- e1.y * uv.x + e1.x * uv.y) / delta};
@@ -539,12 +544,7 @@ renderCUDA(
 			}
 
 			// Step 6. Low pass filter
-			float gs_dir[3] = {mean3D[0]-cam_pos[0], mean3D[1]-cam_pos[1], mean3D[2]-cam_pos[2]};
-			float gs_dir_norm = sqrtf(max(gs_dir[0] * gs_dir[0] + gs_dir[1] * gs_dir[1] + gs_dir[2] * gs_dir[2], 0.0000001f));
-			for(int ii=0; ii<3; ii++)
-				gs_dir[ii] /= gs_dir_norm;
-			float gsdir_dot_n = gs_dir[0] * normal[0] + gs_dir[1] * normal[1] + gs_dir[2] * normal[2];
-			float cos_dn = fabsf(gsdir_dot_n);
+			float cos_dn = collected_op_cos_n[j];
 			float2 res_2d = {(xy.x - pixf.x) / cos_dn, (xy.y - pixf.y) / cos_dn};
 			float dist_2d_norm = FilterInvSquare * (res_2d.x * res_2d.x + res_2d.y * res_2d.y);
 			float G_lps = exp(-0.5f * dist_2d_norm);
@@ -608,13 +608,14 @@ void FORWARD::render(
 	const float* opacities,
 	const float* acutances,
 	const float* cam_pos,
-	const float focal_x, float focal_y,
-	const float* viewmatrix,
+		const float focal_x, float focal_y,
+		const float* viewmatrix,
 
-	float * op,
 	float * op_tu,
 	float * op_tv,
 	float * op_n,
+	const float * op_cos_n,
+	const float2 * kernel_vecs,
 
 	float* final_alpha,
 	uint32_t* n_contrib,
@@ -625,9 +626,10 @@ void FORWARD::render(
 
 	bool cache_sort)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
-		ranges,
-		point_list,
+	if (cache_sort)
+		renderCUDA<NUM_CHANNELS, true> << <grid, block >> > (
+			ranges,
+			point_list,
 		W, H,
 		means3D,
 		means2D,
@@ -644,19 +646,50 @@ void FORWARD::render(
 		focal_x, focal_y,
 		viewmatrix,
 
-		op,
 		op_tu,
 		op_tv,
 		op_n,
+		op_cos_n,
+		kernel_vecs,
 
 		final_alpha,
 		n_contrib,
-		bg_color,
-		out_color,
-		out_depth,
-		out_normal,
-	
-		cache_sort);
+			bg_color,
+			out_color,
+			out_depth,
+			out_normal);
+	else
+		renderCUDA<NUM_CHANNELS, false> << <grid, block >> > (
+			ranges,
+			point_list,
+			W, H,
+			means3D,
+			means2D,
+			colors,
+			depths,
+
+			rotations,
+			scales,
+			thetas,
+			l1l2_rates,
+			opacities,
+			acutances,
+			cam_pos,
+			focal_x, focal_y,
+			viewmatrix,
+
+			op_tu,
+			op_tv,
+			op_n,
+			op_cos_n,
+			kernel_vecs,
+
+			final_alpha,
+			n_contrib,
+			bg_color,
+			out_color,
+			out_depth,
+			out_normal);
 }
 
 
@@ -671,11 +704,11 @@ void FORWARD::preprocess2D(int P, int D, int M,
 	const float* shs,
 	bool* clamped,
 	const float* colors_precomp,
-	const float* viewmatrix,
+		const float* viewmatrix,
 	const float* projmatrix,
 	const float* cam_pos,
 	const int W, int H,
-	const float focal_x, float focal_y,
+		const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	int* radii,
 	float2* means2D,
@@ -688,6 +721,8 @@ void FORWARD::preprocess2D(int P, int D, int M,
 	float * op_tu,
 	float * op_tv,
 	float * op_n,
+	float * op_cos_n,
+	float2 * kernel_vecs,
 
 	bool prefiltered,
 	bool tile_culling)
@@ -704,7 +739,7 @@ void FORWARD::preprocess2D(int P, int D, int M,
 		shs,
 		clamped,
 		colors_precomp,
-		viewmatrix, 
+		viewmatrix,
 		projmatrix,
 		cam_pos,
 		W, H,
@@ -721,9 +756,10 @@ void FORWARD::preprocess2D(int P, int D, int M,
 		op_tu,
 		op_tv,
 		op_n,
+		op_cos_n,
+		kernel_vecs,
 
 		prefiltered,
 		tile_culling
-		);
+			);
 }
-

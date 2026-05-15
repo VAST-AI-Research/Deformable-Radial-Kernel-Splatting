@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -33,6 +33,7 @@ def rasterize_gaussians(
     acutances,
     cache_sort,
     tile_culling,
+    collect_densify,
     raster_settings,
 ):
     return _RasterizeGaussians.apply(
@@ -50,8 +51,51 @@ def rasterize_gaussians(
         acutances,
         cache_sort,
         tile_culling,
+        collect_densify,
         raster_settings,
     )
+
+def rasterize_gaussians_forward(
+    means3D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    thetas,
+    l1l2_rates,
+    rotations,
+    acutances,
+    cache_sort,
+    tile_culling,
+    raster_settings,
+):
+    args = (
+        raster_settings.bg,
+        means3D,
+        colors_precomp,
+        opacities,
+        scales,
+        thetas,
+        l1l2_rates,
+        rotations,
+        acutances,
+        raster_settings.scale_modifier,
+        raster_settings.viewmatrix,
+        raster_settings.projmatrix,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        sh,
+        raster_settings.sh_degree,
+        raster_settings.campos,
+        raster_settings.prefiltered,
+        cache_sort,
+        tile_culling,
+        raster_settings.debug,
+    )
+    num_rendered, color, depth, normal, alpha, radii, _, _, _ = _C.rasterize_gaussians(*args)
+    return color, radii, depth, normal, alpha
 
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
@@ -71,12 +115,13 @@ class _RasterizeGaussians(torch.autograd.Function):
         acutances,
         cache_sort,
         tile_culling,
+        collect_densify,
         raster_settings,
     ):
 
         # Restructure arguments the way that the C++ lib expects them
         args = (
-            raster_settings.bg, 
+            raster_settings.bg,
             means3D,
             colors_precomp,
             opacities,
@@ -119,6 +164,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.save_for_backward(colors_precomp, opacities, means3D, scales, rotations, acutances, thetas, l1l2_rates, radii, sh, geomBuffer, binningBuffer, imgBuffer, color, alpha, depth, normal)
         ctx.cache_sort = cache_sort
         ctx.tile_culling = tile_culling
+        ctx.collect_densify = collect_densify
         # return color, radii
         return color, radii, depth, normal, alpha
 
@@ -130,23 +176,24 @@ class _RasterizeGaussians(torch.autograd.Function):
         colors_precomp, opacities, means3D, scales, rotations, acutances, thetas, l1l2_rates, radii, sh, geomBuffer, binningBuffer, imgBuffer, color, alpha, depth, normal = ctx.saved_tensors
         cache_sort = ctx.cache_sort
         tile_culling = ctx.tile_culling
+        collect_densify = ctx.collect_densify
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
-                means3D, 
-                radii, 
+                means3D,
+                radii,
                 colors_precomp,
                 opacities,
                 scales,
                 thetas,
                 l1l2_rates,
-                rotations, 
-                acutances, 
-                raster_settings.scale_modifier, 
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
+                rotations,
+                acutances,
+                raster_settings.scale_modifier,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
 
                 color,
                 alpha,
@@ -157,8 +204,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 grad_out_alpha,
                 grad_out_depth,
                 grad_out_normal,
-                sh, 
-                raster_settings.sh_degree, 
+                sh,
+                raster_settings.sh_degree,
                 raster_settings.campos,
                 geomBuffer,
                 num_rendered,
@@ -167,6 +214,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
                 cache_sort,
                 tile_culling,
+                collect_densify,
                 raster_settings.debug)
 
         # Compute gradients for relevant tensors by invoking backward method
@@ -180,7 +228,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raise ex
         else:
              grad_means2D, grad_means2D_densify, grad_opacity_densify, grad_colors_precomp, grad_opacities, grad_means3D, grad_sh, grad_scales, grad_thetas, grad_l1l2_rates, grad_rotations, grad_acutances = _C.rasterize_gaussians_backward(*args)
-        
+
         grads = (
             grad_means3D,
             grad_means2D,
@@ -196,6 +244,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_acutances,
             None,
             None,
+            None,
             None
         )
 
@@ -204,7 +253,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -223,23 +272,23 @@ class GaussianRasterizer(nn.Module):
         self.raster_settings = raster_settings
 
     def markVisible(self, positions):
-        # Mark visible points (based on frustum culling for camera) with a boolean 
+        # Mark visible points (based on frustum culling for camera) with a boolean
         with torch.no_grad():
             raster_settings = self.raster_settings
             visible = _C.mark_visible(
                 positions,
                 raster_settings.viewmatrix,
                 raster_settings.projmatrix)
-            
+
         return visible
 
-    def forward(self, means3D, means2D, means2D_densify, opacity_densify, opacities, shs = None, colors_precomp = None, scales=None, thetas=None, l1l2_rates=None, rotations=None, acutances=None, cache_sort=False, tile_culling=False):
-        
+    def forward(self, means3D, means2D, means2D_densify, opacity_densify, opacities, shs = None, colors_precomp = None, scales=None, thetas=None, l1l2_rates=None, rotations=None, acutances=None, cache_sort=False, tile_culling=False, collect_densify=True):
+
         raster_settings = self.raster_settings
 
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
-        
+
         if shs is None:
             shs = torch.Tensor([])
         if colors_precomp is None:
@@ -249,6 +298,22 @@ class GaussianRasterizer(nn.Module):
             scales = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
+
+        if not torch.is_grad_enabled():
+            return rasterize_gaussians_forward(
+                means3D,
+                shs,
+                colors_precomp,
+                opacities,
+                scales,
+                thetas,
+                l1l2_rates,
+                rotations,
+                acutances,
+                cache_sort,
+                tile_culling,
+                raster_settings,
+            )
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
@@ -266,5 +331,6 @@ class GaussianRasterizer(nn.Module):
             acutances,
             cache_sort,
             tile_culling,
-            raster_settings, 
+            collect_densify,
+            raster_settings,
         )

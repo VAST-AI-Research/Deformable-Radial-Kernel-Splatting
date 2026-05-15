@@ -140,13 +140,13 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C, bool CACHE_SORT, bool COLLECT_DENSIFY>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
-	const float* __restrict__ bg_color,
+		const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
@@ -158,14 +158,16 @@ renderCUDA(
 	const float* __restrict__ l1l2_rates,
 	const float* __restrict__ opacities,
 	const float* __restrict__ acutances,
-	const float* __restrict__ cam_pos,
-	const float focal_x, float focal_y,
-	const float* viewmatrix,
+		const float* __restrict__ cam_pos,
+		const float focal_x, float focal_y,
+		const float* viewmatrix,
 
 	const float * __restrict__ op,
 	const float * __restrict__ op_tu,
 	const float * __restrict__ op_tv,
 	const float * __restrict__ op_n,
+	const float * __restrict__ op_cos_n,
+	const float2 * __restrict__ kernel_vecs,
 
 	const float* __restrict__ final_Ts,
 	const float* __restrict__ final_Colors,
@@ -189,9 +191,7 @@ renderCUDA(
 	float* __restrict__ dL_drotations,
 	float* __restrict__ dL_dscale,
 	float* __restrict__ dL_dthetas,
-	float* __restrict__ dL_dl1l2_rates,
-
-	bool cache_sort)
+		float* __restrict__ dL_dl1l2_rates)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -212,7 +212,6 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 
-	__shared__ float  collected_mean3D  [BLOCK_SIZE*3];
 	__shared__ float  collected_Rs      [BLOCK_SIZE*9];
 	__shared__ float  collected_opacity [BLOCK_SIZE];
 	__shared__ float  collected_acutance[BLOCK_SIZE];
@@ -220,6 +219,7 @@ renderCUDA(
 	__shared__ float  collected_op_tu   [BLOCK_SIZE];
 	__shared__ float  collected_op_tv   [BLOCK_SIZE];
 	__shared__ float  collected_op_n    [BLOCK_SIZE];
+	__shared__ float  collected_op_cos_n[BLOCK_SIZE];
 	__shared__ float  collected_op      [BLOCK_SIZE*3];
 	__shared__ float  collected_scales  [BLOCK_SIZE*KERNEL_K];
 	__shared__ float  collected_thetas  [BLOCK_SIZE*KERNEL_K];
@@ -254,9 +254,9 @@ renderCUDA(
 	float Ni[3] = {0};
 	float Di = 0.;
 
-	// CACHE Array to sort the surfels
-	float ray_t_array[CACHE_SIZE] = {0};
-	int js[CACHE_SIZE] = {0};
+		// CACHE Array to sort the surfels
+		float ray_t_array[CACHE_SORT ? CACHE_SIZE : 1] = {0};
+		int js[CACHE_SORT ? CACHE_SIZE : 1] = {0};
 
 	uint32_t contributor = 0;
 	const uint32_t last_contributor = inside? n_contrib[pix_id]: 0;
@@ -299,16 +299,16 @@ renderCUDA(
 		if (num_done == BLOCK_SIZE)
 			break;
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y)
-		{
-			const int coll_id = point_list[range.x + progress];
-			collected_id[block.thread_rank()] = coll_id;
-			if(coll_id >= 0) {
+			if (range.x + progress < range.y)
+			{
+				int coll_id = point_list[range.x + progress];
+				if(coll_id >= 0 && opacities[coll_id] < 1.0f / 255.0f)
+					coll_id = -1;
+				collected_id[block.thread_rank()] = coll_id;
+				if(coll_id >= 0) {
 				collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 				for (int i = 0; i < C; i++)
 					collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
-				for (int i = 0; i < 3; i++)
-					collected_mean3D[i + 3 * block.thread_rank()] = means3D[coll_id * 3 + i];
 				for (int i = 0; i < 9; i++)
 					collected_Rs[i + 9 * block.thread_rank()] = rotations[coll_id * 9 + i];
 				collected_opacity[block.thread_rank()] = opacities[coll_id];
@@ -317,6 +317,7 @@ renderCUDA(
 				collected_op_tu[block.thread_rank()] = op_tu[coll_id];
 				collected_op_tv[block.thread_rank()] = op_tv[coll_id];
 				collected_op_n[block.thread_rank()] = op_n[coll_id];
+				collected_op_cos_n[block.thread_rank()] = op_cos_n[coll_id];
 				for (int i = 0; i < 3; i++)
 					collected_op[i + 3 * block.thread_rank()] = op[coll_id * 3 + i];
 				for (int i = 0; i < KERNEL_K; i++)
@@ -328,13 +329,15 @@ renderCUDA(
 		block.sync();
 
 		// CACHE Array to sort the surfels
-		int next_array[CACHE_SIZE] = {0};
-		int prev_array[CACHE_SIZE] = {0};
-		for(int ii=0; ii<CACHE_SIZE; ii++) {
-			js[ii] = -1;
-			next_array[ii] = -1;
-			prev_array[ii] = -1;
-		}
+			int next_array[CACHE_SORT ? CACHE_SIZE : 1] = {0};
+			int prev_array[CACHE_SORT ? CACHE_SIZE : 1] = {0};
+			if(CACHE_SORT) {
+				for(int ii=0; ii<CACHE_SIZE; ii++) {
+					js[ii] = -1;
+					next_array[ii] = -1;
+					prev_array[ii] = -1;
+				}
+			}
 		int head = 0;
 		int tail = 0;
 		int last_cursor = 0;
@@ -348,14 +351,13 @@ renderCUDA(
 			if(collected_id[jj] < 0) {
 				continue;
 			}
-			
+
 			int j = -1;
-			if(cache_sort) {
+			if(CACHE_SORT) {
 				// There are unprocessed surfels
 				if(jj < min(BLOCK_SIZE, toDo)) {
 					// Pre-calculate Intersection (dir, cam_pos -> uv)
 					const float * Rs = collected_Rs + jj * 9;
-					const float * mean3D = collected_mean3D + jj * 3;
 					const glm::vec3 normal = {Rs[2], Rs[5], Rs[8]};
 					float dir_dot_n = Rs[2] * dir[0] + Rs[5] * dir[1] + Rs[8] * dir[2];
 					float ray_t = collected_op_n[jj] / dir_dot_n;
@@ -376,20 +378,15 @@ renderCUDA(
 			if (j < 0)
 				continue;
 			float2 xy = collected_xy[j];
-			
-			float opacity = opacities[collected_id[j]];
+
+			float opacity = collected_opacity[j];
 			if (opacity < 1.0f / 255.0f)
 				continue;
-			
+
 			// Step 1. Intersection (dir, cam_pos -> uv)
 			const float * Rs = collected_Rs + j * 9;
-			const float * mean3D = collected_mean3D + j * 3;
 			const glm::vec3 normal = {Rs[2], Rs[5], Rs[8]};
 			float dir_dot_n = Rs[2] * dir[0] + Rs[5] * dir[1] + Rs[8] * dir[2];
-			// Truncate to avoid inconsistency
-			const float float_accuracy_scale = 1e7;
-			const float dir_dot_n_abs = roundf(fabsf(dir_dot_n) * float_accuracy_scale) / float_accuracy_scale;
-			dir_dot_n = copysignf(dir_dot_n_abs, dir_dot_n);
 			float ray_t = collected_op_n[j] / dir_dot_n;
 			if (fabsf(dir_dot_n) < 0.0001f)
 				continue;
@@ -404,8 +401,8 @@ renderCUDA(
 			float uv_l2norm = uv.x * uv.x + uv.y * uv.y;
 			// Numerical Protection!
 			uv_l2norm = max(uv_l2norm, 0.00000001);
-			float theta = acos(uv.x / sqrt(uv_l2norm));
-			theta = uv.y > 0? theta: 2.0f*PI - theta;
+			float theta = atan2f(uv.y, uv.x);
+			theta = theta < 0.f? theta + 2.0f * PI: theta;
 			theta = min(theta / (2.0f * PI), 1.0f);
 			const float * thetas_array = collected_thetas + KERNEL_K*j;
 			int k = 0;
@@ -417,10 +414,11 @@ renderCUDA(
 			float rate = 0.5f * (cosf((1.0f - linear_rate) * PI) + 1);
 			float scale_left = scale[k];
 			float scale_right = k==(KERNEL_K-1)? scale[0]: scale[k+1];
-			
+
 			// Step 3. Affine transformation
-			float2 e1 = {cosf(theta_l * 2.0f * PI) * scale_left,  sinf(theta_l * 2.0f * PI) * scale_left};
-			float2 e2 = {cosf(theta_r * 2.0f * PI) * scale_right, sinf(theta_r * 2.0f * PI) * scale_right};
+			const float2 * kernel_vec = kernel_vecs + KERNEL_K*collected_id[j];
+			float2 e1 = kernel_vec[k];
+			float2 e2 = kernel_vec[k==(KERNEL_K-1)? 0: k+1];
 			float delta = e1.x * e2.y - e1.y * e2.x;
 			delta = copysignf(max(fabsf(delta), 0.0000001f), delta);
 			float2 uv_t = {(e2.y * uv.x - e2.x * uv.y) / delta, (- e1.y * uv.x + e1.x * uv.y) / delta};
@@ -460,12 +458,7 @@ renderCUDA(
 			}
 
 			// Step 6. Low pass filter
-			float gs_dir[3] = {mean3D[0]-cam_pos[0], mean3D[1]-cam_pos[1], mean3D[2]-cam_pos[2]};
-			float gs_dir_norm = sqrtf(max(gs_dir[0] * gs_dir[0] + gs_dir[1] * gs_dir[1] + gs_dir[2] * gs_dir[2], 0.0000001f));
-			for(int ii=0; ii<3; ii++)
-				gs_dir[ii] /= gs_dir_norm;
-			float gsdir_dot_n = gs_dir[0] * normal[0] + gs_dir[1] * normal[1] + gs_dir[2] * normal[2];
-			float cos_dn = fabsf(gsdir_dot_n);
+			float cos_dn = collected_op_cos_n[j];
 			float2 res_2d = {(xy.x - pixf.x) / cos_dn, (xy.y - pixf.y) / cos_dn};
 			float dist_2d_norm = FilterInvSquare * (res_2d.x * res_2d.x + res_2d.y * res_2d.y);
 			float G_lps = exp(-0.5f * dist_2d_norm);
@@ -520,6 +513,11 @@ renderCUDA(
 			dL_dalpha += (old_T * pix_depth - (depth_final - Di) / (1 - alpha)) * dL_ddepth;
 
 			if(filter_cond){
+				float gs_dir[3] = {collected_op[j * 3], collected_op[j * 3 + 1], collected_op[j * 3 + 2]};
+				float gs_dir_norm = sqrtf(max(gs_dir[0] * gs_dir[0] + gs_dir[1] * gs_dir[1] + gs_dir[2] * gs_dir[2], 0.0000001f));
+				for(int ii=0; ii<3; ii++)
+					gs_dir[ii] /= gs_dir_norm;
+				float gsdir_dot_n = collected_op_n[j] / gs_dir_norm;
 				// // Half the gradient
 				// dL_dalpha *= 0.5f;
 				// Backward for mean3D
@@ -532,8 +530,10 @@ renderCUDA(
 				float dcameraz_dmean3D[3] = {viewmatrix[8], viewmatrix[9], viewmatrix[10]};
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dscreenx * ddelx_dx);
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dscreeny * ddely_dy);
-				atomicAdd(&dL_dmean2D_densify[global_id].x, fabsf(dL_dscreenx * ddelx_dx));
-				atomicAdd(&dL_dmean2D_densify[global_id].y, fabsf(dL_dscreeny * ddely_dy));
+				if constexpr (COLLECT_DENSIFY) {
+					atomicAdd(&dL_dmean2D_densify[global_id].x, fabsf(dL_dscreenx * ddelx_dx));
+					atomicAdd(&dL_dmean2D_densify[global_id].y, fabsf(dL_dscreeny * ddely_dy));
+				}
 				for(int ii=0; ii<3; ii++){
 					float dL_dmean3D_ii = dL_dscreenx*dscreenx_dcamerax*dcamerax_dmean3D[ii] + dL_dscreeny*dscreeny_dcameray*dcameray_dmean3D[ii];
 					atomicAdd(&(dL_dmeans3D[global_id*3+ii]), dL_dmean3D_ii);
@@ -541,7 +541,9 @@ renderCUDA(
 				// Backward for opacity
 				float dalpha_dopacity = G_lps;
 				atomicAdd(&(dL_dopacity[global_id]), dL_dalpha * dalpha_dopacity);
-				atomicAdd(&dL_dopacity_densify[global_id], fabsf(dL_dalpha * dalpha_dopacity));
+				if constexpr (COLLECT_DENSIFY) {
+					atomicAdd(&dL_dopacity_densify[global_id], fabsf(dL_dalpha * dalpha_dopacity));
+				}
 				// Backward for normal
 				float dalpha_dcos = FilterInvSquare * alpha_lpf / cos_dn * (res_2d.x * res_2d.x + res_2d.y * res_2d.y);
 				float dcos_ddot = copysignf(1.0f, gsdir_dot_n);
@@ -557,7 +559,7 @@ renderCUDA(
 				float dtv_over_dn = dir_dot_tv / dir_dot_n;
 				float dv_dmean3D[3] = {Rs[2] * dtv_over_dn - Rs[1], Rs[5] * dtv_over_dn - Rs[4], Rs[8] * dtv_over_dn - Rs[7]};
 				// UV Backward for R
-				float tangent[3] = {ray_t*dir[0] - op[collected_id[j]*3], ray_t*dir[1] - op[collected_id[j]*3+1], ray_t*dir[2] - op[collected_id[j]*3+2]};
+				float tangent[3] = {ray_t*dir[0] - collected_op[j*3], ray_t*dir[1] - collected_op[j*3+1], ray_t*dir[2] - collected_op[j*3+2]};
 				float du_dR[9] = {0.f};
 				float dv_dR[9] = {0.f};
 				for(int ii=0; ii < 3; ii++) {
@@ -570,9 +572,9 @@ renderCUDA(
 				}
 				// rayt Backward for depth (ray_t)
 				float drayt_dn[3] = {
-					(op[collected_id[j]*3]   * dir_dot_n - op_n[collected_id[j]] * dir[0]) / dir_dot_n / dir_dot_n,
-					(op[collected_id[j]*3+1] * dir_dot_n - op_n[collected_id[j]] * dir[1]) / dir_dot_n / dir_dot_n,
-					(op[collected_id[j]*3+2] * dir_dot_n - op_n[collected_id[j]] * dir[2]) / dir_dot_n / dir_dot_n
+					(collected_op[j*3]   * dir_dot_n - collected_op_n[j] * dir[0]) / dir_dot_n / dir_dot_n,
+					(collected_op[j*3+1] * dir_dot_n - collected_op_n[j] * dir[1]) / dir_dot_n / dir_dot_n,
+					(collected_op[j*3+2] * dir_dot_n - collected_op_n[j] * dir[2]) / dir_dot_n / dir_dot_n
 				};
 				float drayt_dmean3D[3] = {normal[0] / dir_dot_n, normal[1] / dir_dot_n, normal[2] / dir_dot_n};
 				// Backward for UV_T w.r.t UV, theta, scale
@@ -685,7 +687,9 @@ renderCUDA(
 
 				// Update gradients w.r.t. opacity of the Gaussian
 				atomicAdd(&(dL_dopacity[global_id]), dL_dalpha * dalpha_dopacity);
-				atomicAdd(&dL_dopacity_densify[global_id], fabsf(dL_dalpha * dalpha_dopacity));
+				if constexpr (COLLECT_DENSIFY) {
+					atomicAdd(&dL_dopacity_densify[global_id], fabsf(dL_dalpha * dalpha_dopacity));
+				}
 				// Update gradients w.r.t. acutance of the Gaussian
 				atomicAdd(&(dL_dacutance[global_id]), dL_dk_acu);
 
@@ -711,8 +715,10 @@ renderCUDA(
 					atomicAdd(&dL_dmean2D[global_id].y, dL_dmean2Dy_from_3Dii);
 				}
 				// Update gradients for densification
-				atomicAdd(&dL_dmean2D_densify[global_id].x, fabsf(dL_dmean2D_tmp[0]));
-				atomicAdd(&dL_dmean2D_densify[global_id].y, fabsf(dL_dmean2D_tmp[1]));
+				if constexpr (COLLECT_DENSIFY) {
+					atomicAdd(&dL_dmean2D_densify[global_id].x, fabsf(dL_dmean2D_tmp[0]));
+					atomicAdd(&dL_dmean2D_densify[global_id].y, fabsf(dL_dmean2D_tmp[1]));
+				}
 				// Update gradients w.r.t. rotation
 				for(int ii=0; ii<9; ii++)
 					atomicAdd(&(dL_drotations[global_id*9+ii]), dL_dko*dko_duvnorm*duvnorm_dR[ii]);
@@ -748,13 +754,15 @@ void BACKWARD::render(
 	const float* opacities,
 	const float* acutances,
 	const float* cam_pos,
-	const float focal_x, float focal_y,
-	const float* viewmatrix,
+		const float focal_x, float focal_y,
+		const float* viewmatrix,
 
 	const float * op,
 	const float * op_tu,
 	const float * op_tv,
 	const float * op_n,
+	const float * op_cos_n,
+	const float2 * kernel_vecs,
 
 	const float* final_Ts,
 	const float* final_Colors,
@@ -779,13 +787,15 @@ void BACKWARD::render(
 	float* dL_dthetas,
 	float* dL_dl1l2_rates,
 
-	bool cache_sort)
+	bool cache_sort,
+	bool collect_densify)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
-		ranges,
-		point_list,
+	if (cache_sort && collect_densify)
+		renderCUDA<NUM_CHANNELS, true, true> << <grid, block >> >(
+			ranges,
+			point_list,
 		W, H,
-		bg_color,
+			bg_color,
 		means2D,
 		colors,
 		depths,
@@ -805,12 +815,14 @@ void BACKWARD::render(
 		op_tu,
 		op_tv,
 		op_n,
+		op_cos_n,
+		kernel_vecs,
 
 		final_Ts,
 		final_Colors,
 		final_Depths,
 		final_Normals,
-	
+
 		n_contrib,
 		dL_dpixels,
 		dL_dpixels_alpha,
@@ -826,12 +838,163 @@ void BACKWARD::render(
 		dL_dmeans3D,
 		dL_drotations,
 		dL_dscale,
-		dL_dthetas,
-		dL_dl1l2_rates,
+			dL_dthetas,
+			dL_dl1l2_rates
+			);
+	else if (cache_sort)
+		renderCUDA<NUM_CHANNELS, true, false> << <grid, block >> >(
+			ranges,
+			point_list,
+		W, H,
+			bg_color,
+		means2D,
+		colors,
+		depths,
 
-		cache_sort
-		);
-}
+		means3D,
+		rotations,
+		scales,
+		thetas,
+		l1l2_rates,
+		opacities,
+		acutances,
+		cam_pos,
+		focal_x, focal_y,
+		viewmatrix,
+
+		op,
+		op_tu,
+		op_tv,
+		op_n,
+		op_cos_n,
+		kernel_vecs,
+
+		final_Ts,
+		final_Colors,
+		final_Depths,
+		final_Normals,
+
+		n_contrib,
+		dL_dpixels,
+		dL_dpixels_alpha,
+		dL_ddepths,
+		dL_dnormal,
+		dL_dmean2D,
+		dL_dmean2D_densify,
+		dL_dopacity_densify,
+		dL_dopacity,
+		dL_dcolors,
+		dL_dacutance,
+
+		dL_dmeans3D,
+		dL_drotations,
+		dL_dscale,
+			dL_dthetas,
+			dL_dl1l2_rates
+			);
+	else if (collect_densify)
+		renderCUDA<NUM_CHANNELS, false, true> << <grid, block >> >(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			colors,
+			depths,
+
+			means3D,
+			rotations,
+			scales,
+			thetas,
+			l1l2_rates,
+			opacities,
+			acutances,
+			cam_pos,
+			focal_x, focal_y,
+			viewmatrix,
+
+			op,
+			op_tu,
+			op_tv,
+			op_n,
+			op_cos_n,
+			kernel_vecs,
+
+			final_Ts,
+			final_Colors,
+			final_Depths,
+			final_Normals,
+
+			n_contrib,
+			dL_dpixels,
+			dL_dpixels_alpha,
+			dL_ddepths,
+			dL_dnormal,
+			dL_dmean2D,
+			dL_dmean2D_densify,
+			dL_dopacity_densify,
+			dL_dopacity,
+			dL_dcolors,
+			dL_dacutance,
+
+			dL_dmeans3D,
+			dL_drotations,
+			dL_dscale,
+			dL_dthetas,
+			dL_dl1l2_rates
+			);
+	else
+		renderCUDA<NUM_CHANNELS, false, false> << <grid, block >> >(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			colors,
+			depths,
+
+			means3D,
+			rotations,
+			scales,
+			thetas,
+			l1l2_rates,
+			opacities,
+			acutances,
+			cam_pos,
+			focal_x, focal_y,
+			viewmatrix,
+
+			op,
+			op_tu,
+			op_tv,
+			op_n,
+			op_cos_n,
+			kernel_vecs,
+
+			final_Ts,
+			final_Colors,
+			final_Depths,
+			final_Normals,
+
+			n_contrib,
+			dL_dpixels,
+			dL_dpixels_alpha,
+			dL_ddepths,
+			dL_dnormal,
+			dL_dmean2D,
+			dL_dmean2D_densify,
+			dL_dopacity_densify,
+			dL_dopacity,
+			dL_dcolors,
+			dL_dacutance,
+
+			dL_dmeans3D,
+			dL_drotations,
+			dL_dscale,
+			dL_dthetas,
+			dL_dl1l2_rates
+			);
+	}
 
 
 template<int C>

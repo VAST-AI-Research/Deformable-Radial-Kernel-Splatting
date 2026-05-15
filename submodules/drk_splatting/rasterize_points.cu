@@ -169,7 +169,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
 	const bool cache_sort,
 	const bool tile_culling,
-	const bool debug) 
+	const bool collect_densify,
+	const bool debug)
 {
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
@@ -248,6 +249,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dacutances.contiguous().data<float>(),
 
 	  cache_sort,
+	  collect_densify,
 	  debug);
   }
 

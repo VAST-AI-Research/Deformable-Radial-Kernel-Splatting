@@ -42,14 +42,16 @@ namespace FORWARD
 		float2* means2D,
 		float* depths,
 		float* rgb,
-		const dim3 grid,
-		uint32_t* tiles_touched,
+			const dim3 grid,
+			uint32_t* tiles_touched,
 
-		float * op,
+			float * op,
 		float * op_tu,
 		float * op_tv,
 		float * op_n,
-		
+		float * op_cos_n,
+		float2 * kernel_vecs,
+
 		bool prefiltered,
 		bool tile_culling);
 
@@ -74,11 +76,12 @@ namespace FORWARD
 		const float focal_x, float focal_y,
 		const float* viewmatrix,
 
-		float * op,
 		float * op_tu,
 		float * op_tv,
 		float * op_n,
-		
+		const float * op_cos_n,
+		const float2 * kernel_vecs,
+
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,

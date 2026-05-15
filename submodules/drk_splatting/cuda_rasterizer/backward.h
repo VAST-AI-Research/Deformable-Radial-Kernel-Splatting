@@ -45,6 +45,8 @@ namespace BACKWARD
 		const float * op_tu,
 		const float * op_tv,
 		const float * op_n,
+		const float * op_cos_n,
+		const float2 * kernel_vecs,
 
 		const float* final_Ts,
 		const float* final_Colors,
@@ -68,7 +70,8 @@ namespace BACKWARD
 		float* dL_dscale,
 		float* dL_dthetas,
 		float* dL_dl1l2_rates,
-		bool cache_sort);
+		bool cache_sort,
+		bool collect_densify);
 
 	void preprocess(
 		int P, int D, int M,

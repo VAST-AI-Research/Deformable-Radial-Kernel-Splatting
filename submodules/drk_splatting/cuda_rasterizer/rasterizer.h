@@ -102,6 +102,7 @@ namespace CudaRasterizer
 			float* dL_dacutance,
 
 			bool cache_sort,
+			bool collect_densify,
 			bool debug);
 
 	};

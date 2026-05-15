@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -46,11 +46,11 @@ default_pipe = DefaultPipe()
 
 def render(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Tensor=None, scaling_modifier = 1.0, override_color = None, vis_scale_rate=1., sh_degree=None, **kwargs):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
- 
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     screenspace_points_densify = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -133,17 +133,23 @@ def render(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Tensor=None
             "depth": depth}
 
 
-def drk_render_func(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Tensor=None, scaling_modifier=1.0, override_color=None, vis_scale_rate=1., vis_acutance_rate=None, vis_l1l2rate_rate=None, opaque_mode=False, **kwargs):
+def drk_render_func(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Tensor=None, scaling_modifier=1.0, override_color=None, vis_scale_rate=1., vis_acutance_rate=None, vis_l1l2rate_rate=None, opaque_mode=False, collect_densify=True, **kwargs):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.nn.Parameter(torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"))
-    means2D_densify = torch.nn.Parameter(torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"))
-    opacity_grad_densify = torch.nn.Parameter(torch.zeros_like(pc.get_xyz[..., :1], dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"))
+    need_grad = torch.is_grad_enabled()
+    if need_grad and collect_densify:
+        # Create zero tensors used by the densification gradients during training.
+        screenspace_points = torch.nn.Parameter(torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"))
+        means2D_densify = torch.nn.Parameter(torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"))
+        opacity_grad_densify = torch.nn.Parameter(torch.zeros_like(pc.get_xyz[..., :1], dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"))
+    else:
+        screenspace_points = torch.empty((0, 3), dtype=pc.get_xyz.dtype, device=pc.get_xyz.device)
+        means2D_densify = torch.empty((0, 3), dtype=pc.get_xyz.dtype, device=pc.get_xyz.device)
+        opacity_grad_densify = torch.empty((0, 1), dtype=pc.get_xyz.dtype, device=pc.get_xyz.device)
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -151,7 +157,7 @@ def drk_render_func(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Te
 
     bg_color = torch.zeros([3], dtype=torch.float32, device=pc.get_xyz.device) if bg_color is None else bg_color
 
-    camera_center = viewpoint_camera.world_view_transform.T.inverse()[:3, 3]
+    camera_center = viewpoint_camera.camera_center
 
     drk_settings = DRKRasterizationSettings
     rasterizer = DRKRasterizer
@@ -181,7 +187,7 @@ def drk_render_func(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Te
     # scaling / rotation by the rasterizer.
     scales = pc.get_scaling * vis_scale_rate
     rotations = pc.get_rotation
-    
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
@@ -201,13 +207,15 @@ def drk_render_func(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Te
     acutance = pc.get_acutance if vis_acutance_rate is None else torch.ones_like(pc.get_acutance) * vis_acutance_rate
     l1l2_rates = pc.get_l1l2rates if vis_l1l2rate_rate is None else torch.ones_like(pc.get_l1l2rates) * vis_l1l2rate_rate
 
-    args = {"means3D": means3D, "means2D": means2D, "means2D_densify": means2D_densify, "opacity_densify": opacity_grad_densify, "shs": shs, "colors_precomp": colors_precomp, "opacities": opacity, "scales": scales, "thetas": pc.get_thetas, "l1l2_rates": l1l2_rates, "rotations": rotations, "acutances": acutance, 'cache_sort': pc.cache_sort, 'tile_culling': pc.tile_culling}
+    args = {"means3D": means3D, "means2D": means2D, "means2D_densify": means2D_densify, "opacity_densify": opacity_grad_densify, "shs": shs, "colors_precomp": colors_precomp, "opacities": opacity, "scales": scales, "thetas": pc.get_thetas, "l1l2_rates": l1l2_rates, "rotations": rotations, "acutances": acutance, 'cache_sort': pc.cache_sort, 'tile_culling': pc.tile_culling, 'collect_densify': collect_densify}
     if 'cache_sort' in kwargs:
         args['cache_sort'] = kwargs['cache_sort']
     if 'tile_culling' in kwargs:
         args['tile_culling'] = kwargs['tile_culling']
-    
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    if 'collect_densify' in kwargs:
+        args['collect_densify'] = kwargs['collect_densify']
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
     results = rasterizer(**args)
     rendered_image, radii, depth, normal, alpha = results
 
@@ -222,4 +230,3 @@ def drk_render_func(viewpoint_camera, pc, pipe=default_pipe, bg_color : torch.Te
             "depth": depth,
             "normal": normal,
             "bg_color": bg_color}
-

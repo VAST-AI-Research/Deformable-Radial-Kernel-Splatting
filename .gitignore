@@ -1,2 +1,23 @@
 submodules/*/build/
 submodules/*/*.egg-info/
+
+# Python/runtime cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Local extension build artifacts
+*.so
+submodules/*/*/_C.cpython-*.so
+
+# Local benchmark/training outputs
+family_compare_*/
+family_compare_cuda_opt/
+
+# Local helper scripts generated during experiments
+benchmark_render.py
+prune_checkpoint.py
+scripts/family_compare.py
+
+# Local notes generated during optimization
+DRK_CUDA_OPTIMIZATION.md

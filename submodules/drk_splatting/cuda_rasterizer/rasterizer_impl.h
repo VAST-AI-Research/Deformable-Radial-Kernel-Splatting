@@ -42,6 +42,8 @@ namespace CudaRasterizer
 		float* op_tu;
 		float* op_tv;
 		float* op_n;
+		float* op_cos_n;
+		float2* kernel_vecs;
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};

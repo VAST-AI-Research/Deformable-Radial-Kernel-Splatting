@@ -81,6 +81,7 @@ __global__ void duplicateWithKeys(
 	const float focal_x,
 	const float focal_y,
 	const float * rotations,
+	const float2* kernel_vecs,
 	const float2* points_xy_image,
 	float W,
 	float H,
@@ -110,17 +111,14 @@ __global__ void duplicateWithKeys(
 		if(tile_culling) {
 			float3 vert_center_world = {means3D[3 * idx + 0], means3D[3 * idx + 1], means3D[3 * idx + 2]};
 			float3 vert_center_view = transformPoint4x3(vert_center_world, viewmatrix);
-			scales = scales + idx * KERNEL_K;
-			thetas = thetas + idx * KERNEL_K;
 			const float * Rs = rotations + idx * 9;
+			const float2 * kernel_vec = kernel_vecs + idx * KERNEL_K;
 			for(int ii=0; ii<KERNEL_K; ii++) {
-				float scale = scales[ii];
-				float theta = ii==0? 0: thetas[ii-1];
-				float u = NEAREST_VERT_RADIUS * scale * cosf(theta * 2.f * PI);
-				float v = NEAREST_VERT_RADIUS * scale * sinf(theta * 2.f * PI);
+				float u = NEAREST_VERT_RADIUS * kernel_vec[ii].x;
+				float v = NEAREST_VERT_RADIUS * kernel_vec[ii].y;
 				float3 vert_world = {
-					means3D[3 * idx + 0] + u * Rs[0] + v * Rs[1], 
-					means3D[3 * idx + 1] + u * Rs[3] + v * Rs[4], 
+					means3D[3 * idx + 0] + u * Rs[0] + v * Rs[1],
+					means3D[3 * idx + 1] + u * Rs[3] + v * Rs[4],
 					means3D[3 * idx + 2] + u * Rs[6] + v * Rs[7]};
 				
 				float3 vert_view = transformPoint4x3(vert_world, viewmatrix);
@@ -268,6 +266,8 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.op_tu, P, 128);
 	obtain(chunk, geom.op_tv, P, 128);
 	obtain(chunk, geom.op_n, P, 128);
+	obtain(chunk, geom.op_cos_n, P, 128);
+	obtain(chunk, geom.kernel_vecs, P * KERNEL_K, 128);
 
 	return geom;
 }
@@ -376,13 +376,15 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		geomState.depths,
 		geomState.rgb,
-		tile_grid,
-		geomState.tiles_touched,
+			tile_grid,
+			geomState.tiles_touched,
 
-		geomState.op,
-		geomState.op_tu,
+			geomState.op,
+			geomState.op_tu,
 		geomState.op_tv,
 		geomState.op_n,
+		geomState.op_cos_n,
+		geomState.kernel_vecs,
 
 		prefiltered,
 		tile_culling
@@ -415,6 +417,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.tiles_touched,
 		focal_x,
 		focal_y, rotations,
+		geomState.kernel_vecs,
 		geomState.means2D,
 		(float) width, (float) height,
 		geomState.point_offsets,
@@ -465,12 +468,13 @@ int CudaRasterizer::Rasterizer::forward(
 		acutances,
 		cam_pos,
 		focal_x, focal_y,
-		viewmatrix,
+			viewmatrix,
 
-		geomState.op,
-		geomState.op_tu,
+			geomState.op_tu,
 		geomState.op_tv,
 		geomState.op_n,
+		geomState.op_cos_n,
+		geomState.kernel_vecs,
 
 		out_alpha,
 		imgState.n_contrib,
@@ -534,6 +538,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dacutance,
 
 	bool cache_sort,
+	bool collect_densify,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -582,6 +587,8 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.op_tu,
 		geomState.op_tv,
 		geomState.op_n,
+		geomState.op_cos_n,
+		geomState.kernel_vecs,
 
 		out_alpha,
 		out_color,
@@ -605,8 +612,9 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dscale,
 		dL_dthetas,
 		dL_dl1l2_rates,
-		
-		cache_sort), debug)
+
+		cache_sort,
+		collect_densify), debug)
 
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,

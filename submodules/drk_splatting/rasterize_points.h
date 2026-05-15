@@ -80,4 +80,5 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& imageBuffer,
 	const bool cache_sort,
 	const bool tile_culling,
+	const bool collect_densify,
 	const bool debug);
