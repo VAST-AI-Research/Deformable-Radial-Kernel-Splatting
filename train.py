@@ -11,6 +11,8 @@
 
 import os
 import math
+import json
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, l2_loss, ssim, apply_dog_filter, edge_loss
@@ -25,7 +27,6 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.general_utils import line_chart
 import torch.nn.functional as F
 from gui_utils.cam_utils import OrbitCamera
-import dearpygui.dearpygui as dpg
 from PIL import Image
 from piq import ssim as ssim_func, LPIPS
 lpips = LPIPS()
@@ -35,9 +36,83 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+dpg = None
+
+
+def get_dearpygui():
+    global dpg
+    if dpg is None:
+        try:
+            import dearpygui.dearpygui as _dpg
+        except ImportError as exc:
+            raise RuntimeError("--gui requires dearpygui with a compatible libstdc++ runtime") from exc
+        dpg = _dpg
+    return dpg
+
 
 
 gs_dict = {'GS': GaussianModel, 'DRK': DRKModel}
+
+
+@torch.no_grad()
+def _keep_points_no_optimizer(gaussians, keep_mask):
+    gaussians._xyz = torch.nn.Parameter(gaussians._xyz[keep_mask].requires_grad_(True))
+    gaussians._features_dc = torch.nn.Parameter(gaussians._features_dc[keep_mask].requires_grad_(True))
+    gaussians._features_rest = torch.nn.Parameter(gaussians._features_rest[keep_mask].requires_grad_(True))
+    gaussians._opacity = torch.nn.Parameter(gaussians._opacity[keep_mask].requires_grad_(True))
+    gaussians._scaling = torch.nn.Parameter(gaussians._scaling[keep_mask].requires_grad_(True))
+    gaussians._rotation = torch.nn.Parameter(gaussians._rotation[keep_mask].requires_grad_(True))
+    if hasattr(gaussians, "_acutance"):
+        gaussians._acutance = torch.nn.Parameter(gaussians._acutance[keep_mask].requires_grad_(True))
+    if hasattr(gaussians, "_thetas"):
+        gaussians._thetas = torch.nn.Parameter(gaussians._thetas[keep_mask].requires_grad_(True))
+    if hasattr(gaussians, "_l1l2_rates"):
+        gaussians._l1l2_rates = torch.nn.Parameter(gaussians._l1l2_rates[keep_mask].requires_grad_(True))
+    gaussians.max_radii2D = gaussians.max_radii2D[keep_mask]
+
+
+@torch.no_grad()
+def _final_prune_score(gaussians, cameras, score_mode):
+    if score_mode in ["opacity", "sharpen_opacity", "opacity_scale", "opacity_acutance"]:
+        opacity = gaussians.get_opacity.squeeze(-1)
+        if score_mode == "opacity":
+            return opacity
+        if score_mode == "sharpen_opacity" and hasattr(gaussians, "get_sharpen_opacity"):
+            return gaussians.get_sharpen_opacity.squeeze(-1)
+        if score_mode == "opacity_scale":
+            return opacity * gaussians.get_scaling.max(dim=1).values.clamp_min(1e-8)
+        if score_mode == "opacity_acutance" and hasattr(gaussians, "get_acutance"):
+            return opacity * gaussians.get_acutance.squeeze(-1).clamp_min(1e-4)
+
+    visibility_area = torch.zeros(gaussians.get_xyz.shape[0], dtype=torch.float32, device=gaussians.get_xyz.device)
+    for cam in tqdm(cameras, desc="final prune score", leave=False):
+        render_pkg = gaussians.render_func(
+            cam,
+            gaussians,
+            bg_color=torch.zeros(3, dtype=torch.float32, device=gaussians.get_xyz.device),
+            tile_culling=False,
+            collect_densify=False,
+        )
+        radii = render_pkg["radii"].float()
+        visible = radii > 0
+        visibility_area[visible] += (radii[visible] * radii[visible]).clamp_min(1.0)
+    visibility_area = visibility_area / max(1, len(cameras))
+    if score_mode == "visible_area":
+        return visibility_area
+    if score_mode == "visible_area_opacity":
+        return visibility_area * gaussians.get_opacity.squeeze(-1).clamp_min(1e-6)
+    if score_mode == "visible_area_sharp":
+        opacity = gaussians.get_sharpen_opacity.squeeze(-1) if hasattr(gaussians, "get_sharpen_opacity") else gaussians.get_opacity.squeeze(-1)
+        return visibility_area * opacity.clamp_min(1e-6)
+    raise ValueError(f"Unsupported final prune score: {score_mode}")
+
+
+def in_iter_window(iteration, start_iter, end_iter, default_start=0, default_end=None):
+    start_iter = default_start if start_iter is None or start_iter < 0 else start_iter
+    end_iter = default_end if end_iter is None or end_iter < 0 else end_iter
+    if iteration < start_iter:
+        return False
+    return end_iter is None or iteration <= end_iter
 
 
 def getProjectionMatrix(znear, zfar, fovX, fovY):
@@ -167,6 +242,8 @@ class Trainer:
         self.best_lpips = np.inf
         self.best_iteration = -1
         self.ema_loss_for_log = 0.0
+        self.train_wall_start = None
+        self.cuda_iter_ms = []
         self.progress_bar = tqdm(range(self.first_iter, self.opt.iterations), desc="Training progress")
         self.first_iter += 1
 
@@ -190,6 +267,7 @@ class Trainer:
         self.feat_transform_func = lambda x: np.copy(x[..., :3])
         
         if self.gui:
+            get_dearpygui()
             dpg.create_context()
             self.register_dpg()
             self.test_step()
@@ -553,8 +631,57 @@ class Trainer:
     
     # no gui mode
     def train(self):
+        self.train_wall_start = time.time()
         while self.iteration < self.opt.iterations+1:
             self.train_step()
+        self.final_prune()
+        self.write_train_stats()
+
+    def write_train_stats(self):
+        total_wall_time = time.time() - self.train_wall_start if self.train_wall_start is not None else 0.0
+        trained_steps = max(0, self.opt.iterations - self.first_iter + 1)
+        cuda_ms = self.cuda_iter_ms
+        stats = {
+            "iterations": int(self.opt.iterations),
+            "trained_steps": int(trained_steps),
+            "wall_time_sec": float(total_wall_time),
+            "steps_per_sec_wall": float(trained_steps / total_wall_time) if total_wall_time > 0 else 0.0,
+            "avg_cuda_iter_ms": float(sum(cuda_ms) / len(cuda_ms)) if cuda_ms else 0.0,
+            "avg_cuda_iter_ms_last_1000": float(sum(cuda_ms[-1000:]) / len(cuda_ms[-1000:])) if cuda_ms else 0.0,
+            "points": int(self.gaussians.get_xyz.shape[0]),
+            "best_test_psnr": float(self.best_psnr),
+            "best_test_iteration": int(self.best_iteration),
+            "best_test_ssim": float(self.best_ssim),
+            "best_test_lpips": float(self.best_lpips),
+        }
+        path = os.path.join(self.scene.model_path, "train_stats.json")
+        with open(path, "w") as f:
+            json.dump(stats, f, indent=2, sort_keys=True)
+        print(f"Training stats saved to {path}")
+
+    @torch.no_grad()
+    def final_prune(self):
+        target = getattr(self.opt, "final_prune_target", -1)
+        if target is None or target <= 0 or target >= self.gaussians.get_xyz.shape[0]:
+            return
+
+        score_split = getattr(self.opt, "final_prune_split", "train")
+        if score_split == "test":
+            cameras = self.scene.getTestCameras()
+        elif score_split == "all":
+            cameras = self.scene.getTrainCameras() + self.scene.getTestCameras()
+        else:
+            cameras = self.scene.getTrainCameras()
+
+        before = int(self.gaussians.get_xyz.shape[0])
+        score = _final_prune_score(self.gaussians, cameras, getattr(self.opt, "final_prune_score", "visible_area_sharp"))
+        prune_count = before - target
+        _, prune_idx = torch.topk(score, prune_count, largest=False)
+        keep_mask = torch.ones(before, dtype=torch.bool, device=score.device)
+        keep_mask[prune_idx] = False
+        _keep_points_no_optimizer(self.gaussians, keep_mask)
+        self.scene.save(self.opt.iterations)
+        print(f"\n[ITER {self.opt.iterations}] Final contribution prune: {before} -> {self.gaussians.get_xyz.shape[0]}")
     
     def train_step(self):
         self.gaussians.train()
@@ -581,7 +708,16 @@ class Trainer:
         random_bg_cond = self.opt.random_background and viewpoint_cam.gt_alpha_mask is not None and self.iteration < self.opt.densify_until_iter
         bg = torch.rand((3), device="cuda") if random_bg_cond else self.background
 
-        render_pkg = self.gaussians.render_func(viewpoint_cam, self.gaussians, self.pipe, bg)
+        collect_densify = self.iteration < self.opt.densify_until_iter
+        if getattr(self.opt, "skip_densify_stats_after", True) is False:
+            collect_densify = True
+        render_pkg = self.gaussians.render_func(
+            viewpoint_cam,
+            self.gaussians,
+            self.pipe,
+            bg,
+            collect_densify=collect_densify,
+        )
         image, visibility_filter, radii = render_pkg["render"], render_pkg["visibility_filter"], render_pkg["radii"]
 
 
@@ -599,6 +735,40 @@ class Trainer:
             mask_loss = 0.
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - self.opt.lambda_dssim) * Ll1 + self.opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + self.opt.lambda_im_laplace * mask_loss
+
+        alpha_weight = 0.0
+        if self.opt.lambda_alpha_mask > 0:
+            alpha_start = self.opt.alpha_mask_from_iter if self.opt.alpha_mask_from_iter >= 0 else self.opt.densify_from_iter
+            alpha_active = in_iter_window(self.iteration, alpha_start, self.opt.alpha_mask_until_iter)
+            if alpha_active:
+                if self.opt.alpha_mask_warmup > 0:
+                    alpha_weight = min(1.0, max(0.0, (self.iteration - alpha_start + 1) / self.opt.alpha_mask_warmup))
+                    alpha_weight *= self.opt.lambda_alpha_mask
+                else:
+                    alpha_weight = self.opt.lambda_alpha_mask
+        if alpha_weight > 0 and viewpoint_cam.gt_alpha_mask is not None and "alpha" in render_pkg:
+            gt_alpha_mask = viewpoint_cam.gt_alpha_mask.to(image.device)
+            alpha_loss = torch.nn.functional.binary_cross_entropy(
+                render_pkg["alpha"].clamp(1e-4, 1 - 1e-4),
+                gt_alpha_mask.clamp(0.0, 1.0),
+            )
+            loss = loss + alpha_weight * alpha_loss
+
+        # Multi-scale anti-aliasing loss
+        if self.opt.lambda_multiscale > 0:
+            scales = [float(s) for s in self.opt.multiscale_scales.split(",")]
+            ms_loss = 0.0
+            for scale in scales:
+                img_scaled = F.interpolate(image.unsqueeze(0), scale_factor=scale, mode='bilinear', align_corners=False)
+                gt_scaled = F.interpolate(gt_image.unsqueeze(0), scale_factor=scale, mode='bilinear', align_corners=False)
+                ms_loss += l1_loss(img_scaled, gt_scaled) + (1.0 - ssim(img_scaled.squeeze(0), gt_scaled.squeeze(0)))
+            loss = loss + self.opt.lambda_multiscale * ms_loss / len(scales)
+
+        # Opacity regularization for floater suppression
+        if self.opt.lambda_opacity_reg > 0 and self.iteration > self.opt.opacity_reg_from_iter:
+            opacity_vals = self.gaussians.get_opacity
+            opacity_reg = (opacity_vals * (1.0 - opacity_vals)).mean()
+            loss = loss + self.opt.lambda_opacity_reg * opacity_reg
 
         if hasattr(self.gaussians, 'regularization_loss') and self.iteration > self.opt.densify_from_iter and self.iteration < self.opt.densify_until_iter:
             loss = loss + self.gaussians.regularization_loss()
@@ -620,7 +790,9 @@ class Trainer:
                 self.progress_bar.close()
 
             # Log and save
-            cur_psnr, cur_ssim, cur_lpips, val_psnr = training_report(self.tb_writer, self.iteration, Ll1, loss, l1_loss, self.iter_start.elapsed_time(self.iter_end), self.testing_iterations, self.scene, self.gaussians.render_func, (self.pipe, self.background), trainer=self)
+            iter_elapsed = self.iter_start.elapsed_time(self.iter_end)
+            self.cuda_iter_ms.append(float(iter_elapsed))
+            cur_psnr, cur_ssim, cur_lpips, val_psnr = training_report(self.tb_writer, self.iteration, Ll1, loss, l1_loss, iter_elapsed, self.testing_iterations, self.scene, self.gaussians.render_func, (self.pipe, self.background), trainer=self)
             if self.iteration in self.testing_iterations:
                 if cur_psnr.item() > self.best_psnr:
                     self.best_psnr = cur_psnr.item()
@@ -650,7 +822,30 @@ class Trainer:
 
                 if self.iteration > self.opt.densify_from_iter and self.iteration % self.gaussians.densification_interval == 0:
                     size_threshold = 20 if self.iteration > self.gaussians.opacity_reset_interval else None
-                    self.gaussians.densify_and_prune(self.gaussians.densify_grad_threshold, self.gaussians.min_opacity_pruning, self.scene.cameras_extent, size_threshold)
+                    use_mcmc = getattr(self.gaussians, "use_mcmc", False)
+                    mcmc_active = use_mcmc and in_iter_window(
+                        self.iteration,
+                        getattr(self.gaussians, "mcmc_start_iter", -1),
+                        getattr(self.gaussians, "mcmc_end_iter", -1),
+                        default_start=self.opt.densify_from_iter,
+                        default_end=self.opt.densify_until_iter,
+                    )
+                    mcmc_strategy = getattr(self.gaussians, "mcmc_strategy", "replace")
+                    if mcmc_active and mcmc_strategy == "replace":
+                        relocated, added, pruned = self.gaussians.mcmc_densify()
+                        if self.iteration % 1000 == 0:
+                            print(f"\n[ITER {self.iteration}] MCMC relocated {relocated}, added {added}, pruned {pruned}, GS {self.gaussians._xyz.shape[0]}")
+                    else:
+                        self.gaussians.densify_and_prune(self.gaussians.densify_grad_threshold, self.gaussians.min_opacity_pruning, self.scene.cameras_extent, size_threshold)
+                        if mcmc_active:
+                            if mcmc_strategy == "hybrid":
+                                relocated, added, pruned = self.gaussians.mcmc_densify()
+                            elif mcmc_strategy == "prune":
+                                relocated, added, pruned = 0, 0, self.gaussians.mcmc_prune()
+                            else:
+                                relocated, added, pruned = 0, 0, 0
+                            if self.iteration % 1000 == 0:
+                                print(f"\n[ITER {self.iteration}] MCMC {mcmc_strategy} relocated {relocated}, added {added}, pruned {pruned}, GS {self.gaussians._xyz.shape[0]}")
             
                 if self.iteration !=0 and self.iteration % self.gaussians.opacity_reset_interval == 0 or (self.dataset.white_background and self.iteration == self.opt.densify_from_iter):
                     self.gaussians.reset_opacity()
@@ -658,6 +853,14 @@ class Trainer:
             # Optimizer step
             if self.iteration < self.opt.iterations:
                 self.gaussians.optimizer.step()
+                if getattr(self.gaussians, "use_mcmc", False) and in_iter_window(
+                    self.iteration,
+                    getattr(self.gaussians, "mcmc_start_iter", -1),
+                    getattr(self.gaussians, "mcmc_end_iter", -1),
+                    default_start=self.opt.densify_from_iter,
+                    default_end=self.opt.densify_until_iter,
+                ):
+                    self.gaussians.add_mcmc_noise()
                 self.gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (self.iteration in self.checkpoint_iterations):
@@ -883,7 +1086,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     ssim_list.append(ssim_func(image[None], gt_image[None], data_range=1.).mean())
                     lpips_list.append(lpips(image[None], gt_image[None]).mean())
                     if viewpoint.gt_alpha_mask is not None and trainer.dataset.metric_masked:
-                        image_mask = image * viewpoint.gt_alpha_mask.to(image.device)
+                        image_mask = viewpoint.gt_alpha_mask.to(image.device)
                         image_masked = image * image_mask
                         gt_image_masked = gt_image * image_mask
                         psnr_masked_list.append(psnr(image_masked, gt_image_masked).mean().double())
@@ -994,4 +1197,3 @@ if __name__ == "__main__":
     else:
         trainer.train()
         print("\nTraining complete.")
-

@@ -132,6 +132,34 @@ python ./scripts/mip360_script.py   # For MipNeRF-360
 
 ---
 
+## Recent Optimizations
+
+### CUDA Rasterization Overhaul
+- **Precomputed kernel vectors**: `scale * [cos(θ), sin(θ)]` computed once in preprocess, reused in rendering and tile culling
+- **`atan2f` replaces `acos+sqrt`**: faster angle computation in inner loop
+- **Removed `roundf` truncation**: eliminated expensive per-hit rounding
+- **Shared memory optimization**: geometry buffer strategy to stay within 48KB limit
+- **Densification stats via CUDA**: collect absolute gradients (`fabsf`) directly in backward kernel, avoiding Python overhead
+
+### CUDA Performance (Round 2)
+- **Branchless segment search**: replaced branch-heavy linear scan with predicated additions for better warp coherence
+- **Fast math intrinsics**: `__expf`, `__cosf`, `__sincosf`, `__frcp_rn` to replace standard `exp`/`cos`/`sin`/division
+- **Cached reciprocals**: pre-compute `1/delta`, `1/(scale²)`, `1/(theta_r−theta_l)`, `1/dir_dot_n` etc. to eliminate redundant divisions
+- **Compiler flags**: `--use_fast_math -O3 --ftz=true` in `setup.py`
+
+### Rendering Quality
+- **Opacity-gradient driven densification**: combine position and opacity gradients for more accurate densification decisions
+- **Visibility-aware pruning**: prune low-visibility + low-opacity floaters during densification
+- **Multi-scale anti-aliasing loss** (`--lambda_multiscale`): optional multi-resolution L1+SSIM supervision
+- **Opacity regularization** (`--lambda_opacity_reg`): entropy-based regularization to suppress semi-transparent floaters
+
+### Misc
+- Fixed install instructions and added `.gitignore` for build outputs
+- `simple_knn.cu`: use `<float.h>` instead of hardcoded `FLT_MAX`
+- `gui_utils`: graceful fallback when `dearpygui` is not installed
+
+---
+
 ## Citing
 
 If you find our work useful, please consider citing:

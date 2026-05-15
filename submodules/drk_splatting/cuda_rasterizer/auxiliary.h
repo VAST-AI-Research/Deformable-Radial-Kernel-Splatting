@@ -199,6 +199,35 @@ __forceinline__ __device__ int kernel_search_sorted(const float x, const float* 
     return low + 1;
 }
 
+// Branchless segment search for KERNEL_K=8
+// Uses predicated additions instead of branches for better warp coherence
+__forceinline__ __device__ int branchless_segment_search(const float theta, const float* thetas_array) {
+	int k = 0;
+	k += (thetas_array[0] < theta);
+	k += (thetas_array[1] < theta);
+	k += (thetas_array[2] < theta);
+	k += (thetas_array[3] < theta);
+	k += (thetas_array[4] < theta);
+	k += (thetas_array[5] < theta);
+	k += (thetas_array[6] < theta);
+	return k;
+}
+
+// Warp-level reduction for float values
+__forceinline__ __device__ float warpReduceSum(float val) {
+	for (int offset = 16; offset > 0; offset >>= 1)
+		val += __shfl_down_sync(0xffffffff, val, offset);
+	return val;
+}
+
+// Warp-level reduction for accumulating gradients to the same target
+// Returns true only for the first thread in the warp that has this global_id
+__forceinline__ __device__ bool warpFirstForId(int global_id) {
+	unsigned mask = __match_any_sync(0xffffffff, global_id);
+	int leader = __ffs(mask) - 1;
+	return (threadIdx.x % 32) == leader;
+}
+
 __forceinline__ __device__ float3 calculate_rayt(const float* viewmatrix, const float* cam_pos, const float* mean3D, const float focal_x, const float focal_y, const float* Rs, float2 pixf, float W, float H, bool filter_side, glm::vec3& intersect) {
 	glm::vec3 dir_camera = {(pixf.x - (W-1.0) * 0.5) / focal_x, (pixf.y - (H-1.0) * 0.5) / focal_y, 1.0f};
 	float dir_norm = sqrt(dir_camera[0] * dir_camera[0] + dir_camera[1] * dir_camera[1] + dir_camera[2] * dir_camera[2]);

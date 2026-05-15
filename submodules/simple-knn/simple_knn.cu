@@ -16,6 +16,7 @@
 #include "simple_knn.h"
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <float.h>
 #include <vector>
 #include <cuda_runtime_api.h>
 #include <thrust/device_vector.h>
@@ -78,7 +79,6 @@ struct MinMax
 __global__ void boxMinMax(uint32_t P, float3* points, uint32_t* indices, MinMax* boxes)
 {
 	auto idx = cg::this_grid().thread_rank();
-	// const float FLT_MAX=3.402823466e+38F;
 
 	MinMax me;
 	if (idx < P)
@@ -152,7 +152,6 @@ __global__ void boxMeanDist(uint32_t P, float3* points, uint32_t* indices, MinMa
 		return;
 
 	float3 point = points[indices[idx]];
-	// const float FLT_MAX=3.402823466e+38F;
 	float best[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
 
 	for (int i = max(0, idx - 3); i <= min(P - 1, idx + 3); i++)

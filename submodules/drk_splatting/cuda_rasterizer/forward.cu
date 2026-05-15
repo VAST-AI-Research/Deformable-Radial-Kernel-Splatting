@@ -494,18 +494,17 @@ renderCUDA(
 			const float * scale = collected_scales + KERNEL_K*j;
 			float uv_l2norm = uv.x * uv.x + uv.y * uv.y;
 			// Numerical Protection!
-			uv_l2norm = max(uv_l2norm, 0.00000001);
+			uv_l2norm = max(uv_l2norm, 0.00000001f);
 			float theta = atan2f(uv.y, uv.x);
 			theta = theta < 0.f? theta + 2.0f * PI: theta;
-			theta = min(theta / (2.0f * PI), 1.0f);
+			theta = fminf(theta * (0.5f / PI), 1.0f);
 			const float * thetas_array = collected_thetas + KERNEL_K*j;
-			int k = 0;
-			for(int ii=0; ii<KERNEL_K-1; ii++)
-				k += thetas_array[ii]>=theta? 0: 1;
+			int k = branchless_segment_search(theta, thetas_array);
 			float theta_l = k==0? 0.0f: thetas_array[k-1];
 			float theta_r = thetas_array[k];
-			float linear_rate = (theta - theta_l) / (theta_r - theta_l);
-			float rate = 0.5f * (cosf((1.0f - linear_rate) * PI) + 1);
+			float inv_theta_span = __frcp_rn(theta_r - theta_l);
+			float linear_rate = (theta - theta_l) * inv_theta_span;
+			float rate = 0.5f * (__cosf((1.0f - linear_rate) * PI) + 1.0f);
 			float scale_left = scale[k];
 			float scale_right = k==(KERNEL_K-1)? scale[0]: scale[k+1];
 
@@ -514,18 +513,21 @@ renderCUDA(
 			float2 e1 = kernel_vec[k];
 			float2 e2 = kernel_vec[k==(KERNEL_K-1)? 0: k+1];
 			float delta = e1.x * e2.y - e1.y * e2.x;
-			delta = copysignf(max(fabsf(delta), 0.0000001f), delta);
-			float2 uv_t = {(e2.y * uv.x - e2.x * uv.y) / delta, (- e1.y * uv.x + e1.x * uv.y) / delta};
+			delta = copysignf(fmaxf(fabsf(delta), 0.0000001f), delta);
+			float inv_delta = __frcp_rn(delta);
+			float2 uv_t = {(e2.y * uv.x - e2.x * uv.y) * inv_delta, (- e1.y * uv.x + e1.x * uv.y) * inv_delta};
 
 			// Step 4. Kernel function (theta, uv_norm -> kernel_opacity)
 			float l1l2_rate = collected_l1l2rate[j];
 			float uvt_l1norm = fabsf(uv_t.x) + fabsf(uv_t.y);
 			uvt_l1norm = uvt_l1norm * uvt_l1norm * 0.5f;
-			uvt_l1norm = max(uvt_l1norm, 0.00000001);
-			float uvt_l2norm = uv_l2norm * (rate / (scale_right*scale_right) + (1 - rate) / (scale_left*scale_left)) * 0.5f;
-			uvt_l2norm = max(uvt_l2norm, 0.00000001);
-			float uv_norm = l1l2_rate * uvt_l1norm + (1 - l1l2_rate) * uvt_l2norm;
-			float kernel_opacity = exp(- uv_norm);
+			uvt_l1norm = fmaxf(uvt_l1norm, 0.00000001f);
+			float inv_sl2 = __frcp_rn(scale_left*scale_left);
+			float inv_sr2 = __frcp_rn(scale_right*scale_right);
+			float uvt_l2norm = uv_l2norm * (rate * inv_sr2 + (1.0f - rate) * inv_sl2) * 0.5f;
+			uvt_l2norm = fmaxf(uvt_l2norm, 0.00000001f);
+			float uv_norm = l1l2_rate * uvt_l1norm + (1.0f - l1l2_rate) * uvt_l2norm;
+			float kernel_opacity = __expf(- uv_norm);
 
 			// Step 5. Sharpening
 			const float k_acu = collected_acutance[j];
@@ -545,9 +547,10 @@ renderCUDA(
 
 			// Step 6. Low pass filter
 			float cos_dn = collected_op_cos_n[j];
-			float2 res_2d = {(xy.x - pixf.x) / cos_dn, (xy.y - pixf.y) / cos_dn};
+			float inv_cos_dn = __frcp_rn(cos_dn);
+			float2 res_2d = {(xy.x - pixf.x) * inv_cos_dn, (xy.y - pixf.y) * inv_cos_dn};
 			float dist_2d_norm = FilterInvSquare * (res_2d.x * res_2d.x + res_2d.y * res_2d.y);
-			float G_lps = exp(-0.5f * dist_2d_norm);
+			float G_lps = __expf(-0.5f * dist_2d_norm);
 			float alpha_lpf = opacity * G_lps;
 			bool filter_cond = (alpha < alpha_lpf) & LOW_PASS_FILTER;
 			alpha = filter_cond? alpha_lpf: alpha;

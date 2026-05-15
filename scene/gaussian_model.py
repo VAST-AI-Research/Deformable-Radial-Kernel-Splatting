@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import math
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -21,6 +22,44 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from gaussian_renderer import render, drk_render_func
+
+MCMC_N_MAX = 51
+_MCMC_BINOMS = None
+
+
+def get_mcmc_binoms(device):
+    global _MCMC_BINOMS
+    if _MCMC_BINOMS is None or _MCMC_BINOMS.device != device:
+        binoms = torch.zeros((MCMC_N_MAX, MCMC_N_MAX), dtype=torch.float32, device=device)
+        for n in range(MCMC_N_MAX):
+            for k in range(n + 1):
+                binoms[n, k] = math.comb(n, k)
+        _MCMC_BINOMS = binoms
+    return _MCMC_BINOMS
+
+
+def compute_mcmc_relocation(opacity_old, scale_old, N):
+    N = N.to(dtype=torch.long).clamp_(min=1, max=MCMC_N_MAX - 1)
+    opacity_old = opacity_old.clamp(
+        min=torch.finfo(torch.float32).eps,
+        max=1.0 - torch.finfo(torch.float32).eps,
+    )
+    opacity_new = 1.0 - torch.pow(1.0 - opacity_old, 1.0 / N.to(opacity_old.dtype))
+
+    binoms = get_mcmc_binoms(opacity_old.device)
+    denom_sum = torch.zeros_like(opacity_new)
+    for i in range(1, MCMC_N_MAX):
+        active = N >= i
+        if not active.any():
+            break
+        cur_sum = torch.zeros_like(opacity_new)
+        for k in range(i):
+            sign = -1.0 if (k % 2) else 1.0
+            cur_sum = cur_sum + sign * binoms[i - 1, k] * torch.pow(opacity_new, k + 1) / math.sqrt(k + 1)
+        denom_sum = torch.where(active, denom_sum + cur_sum, denom_sum)
+
+    coeff = (opacity_old / denom_sum.clamp_min(torch.finfo(torch.float32).eps)).unsqueeze(-1)
+    return opacity_new, coeff * scale_old
 
 
 class GaussianModel:
@@ -80,6 +119,19 @@ class GaussianModel:
         self.training = False
         self.current_opt_step = 0
         self.cache_sort = False
+        self.use_mcmc = False
+        self.mcmc_strategy = "replace"
+        self.mcmc_start_iter = -1
+        self.mcmc_end_iter = -1
+        self.mcmc_cap_max = -1
+        self.mcmc_growth_rate = 1.05
+        self.mcmc_min_opacity = 0.005
+        self.mcmc_noise_lr = 0.0
+        self.mcmc_opacity_reg = 0.0
+        self.mcmc_scale_reg = 0.0
+        self.mcmc_prune_min_opacity = 0.0
+        self.mcmc_prune_score = "opacity"
+        self.current_xyz_lr = 0.0
         self.setup_functions()
 
     def capture(self):
@@ -179,6 +231,18 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.densification_interval = training_args.densification_interval
         self.opacity_reset_interval = training_args.opacity_reset_interval
+        self.use_mcmc = getattr(training_args, "use_mcmc", False)
+        self.mcmc_strategy = getattr(training_args, "mcmc_strategy", "replace")
+        self.mcmc_start_iter = getattr(training_args, "mcmc_start_iter", -1)
+        self.mcmc_end_iter = getattr(training_args, "mcmc_end_iter", -1)
+        self.mcmc_cap_max = getattr(training_args, "mcmc_cap_max", -1)
+        self.mcmc_growth_rate = getattr(training_args, "mcmc_growth_rate", 1.05)
+        self.mcmc_min_opacity = getattr(training_args, "mcmc_min_opacity", 0.005)
+        self.mcmc_noise_lr = getattr(training_args, "mcmc_noise_lr", 0.0)
+        self.mcmc_opacity_reg = getattr(training_args, "mcmc_opacity_reg", 0.0)
+        self.mcmc_scale_reg = getattr(training_args, "mcmc_scale_reg", 0.0)
+        self.mcmc_prune_min_opacity = getattr(training_args, "mcmc_prune_min_opacity", 0.0)
+        self.mcmc_prune_score = getattr(training_args, "mcmc_prune_score", "opacity")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -201,6 +265,7 @@ class GaussianModel:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
+                self.current_xyz_lr = lr
                 return lr
 
     def construct_list_of_attributes(self):
@@ -383,6 +448,182 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def reset_optimizer_state(self, inds=None):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            if not len(group["params"]) == 1:
+                continue
+            tensor = group["params"][0]
+            stored_state = self.optimizer.state.get(tensor, None)
+            if stored_state is not None:
+                if inds is None:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                else:
+                    stored_state["exp_avg"][inds] = 0
+                    stored_state["exp_avg_sq"][inds] = 0
+                del self.optimizer.state[tensor]
+                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                self.optimizer.state[group["params"][0]] = stored_state
+            else:
+                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+            optimizable_tensors[group["name"]] = group["params"][0]
+        return optimizable_tensors
+
+    def refresh_parameters_from_optimizer(self, optimizable_tensors):
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+    def _sample_mcmc_sources(self, probs, num, alive_indices=None):
+        probs = probs / (probs.sum() + torch.finfo(torch.float32).eps)
+        sampled_idxs = torch.multinomial(probs, num, replacement=True)
+        if alive_indices is not None:
+            sampled_idxs = alive_indices[sampled_idxs]
+        ratio = torch.bincount(sampled_idxs, minlength=self.get_xyz.shape[0]).unsqueeze(-1)
+        return sampled_idxs, ratio
+
+    def _mcmc_updated_params(self, idxs, ratio):
+        new_opacity, new_scaling = compute_mcmc_relocation(
+            opacity_old=self.get_opacity[idxs, 0],
+            scale_old=self.get_scaling[idxs],
+            N=ratio[idxs, 0] + 1,
+        )
+        new_opacity = torch.clamp(
+            new_opacity.unsqueeze(-1),
+            min=self.mcmc_min_opacity,
+            max=1.0 - torch.finfo(torch.float32).eps,
+        )
+        return {
+            "xyz": self._xyz[idxs],
+            "f_dc": self._features_dc[idxs],
+            "f_rest": self._features_rest[idxs],
+            "opacity": self.inverse_opacity_activation(new_opacity),
+            "scaling": self.scaling_inverse_activation(new_scaling),
+            "rotation": self._rotation[idxs],
+        }
+
+    def _mcmc_assign_params(self, indices, params):
+        self._xyz.data[indices] = params["xyz"]
+        self._features_dc.data[indices] = params["f_dc"]
+        self._features_rest.data[indices] = params["f_rest"]
+        self._opacity.data[indices] = params["opacity"]
+        self._scaling.data[indices] = params["scaling"]
+        self._rotation.data[indices] = params["rotation"]
+
+    def _mcmc_copy_source_params(self, source_indices, target_indices):
+        self._opacity.data[source_indices] = self._opacity.data[target_indices]
+        self._scaling.data[source_indices] = self._scaling.data[target_indices]
+
+    def _mcmc_append_params(self, params):
+        self.densification_postfix(
+            params["xyz"],
+            params["f_dc"],
+            params["f_rest"],
+            params["opacity"],
+            params["scaling"],
+            params["rotation"],
+        )
+
+    @torch.no_grad()
+    def relocate_gs(self, dead_mask):
+        if dead_mask.sum() == 0:
+            return 0
+        alive_mask = ~dead_mask
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+        if alive_indices.shape[0] == 0:
+            return 0
+
+        probs = self.get_opacity[alive_indices, 0]
+        reinit_idx, ratio = self._sample_mcmc_sources(probs, dead_indices.shape[0], alive_indices=alive_indices)
+        params = self._mcmc_updated_params(reinit_idx, ratio)
+        self._mcmc_assign_params(dead_indices, params)
+        self._mcmc_copy_source_params(reinit_idx, dead_indices)
+        self.refresh_parameters_from_optimizer(self.reset_optimizer_state(inds=torch.cat([dead_indices, reinit_idx]).unique()))
+        return int(dead_indices.shape[0])
+
+    @torch.no_grad()
+    def add_new_gs(self, cap_max=None):
+        cap_max = self.mcmc_cap_max if cap_max is None else cap_max
+        current_num_points = self._opacity.shape[0]
+        if cap_max is None or cap_max <= 0:
+            target_num = int(self.mcmc_growth_rate * current_num_points)
+        else:
+            target_num = min(cap_max, int(self.mcmc_growth_rate * current_num_points))
+        num_gs = max(0, target_num - current_num_points)
+        if num_gs <= 0:
+            return 0
+
+        add_idx, ratio = self._sample_mcmc_sources(self.get_opacity.squeeze(-1), num_gs)
+        params = self._mcmc_updated_params(add_idx, ratio)
+        self._opacity.data[add_idx] = params["opacity"]
+        self._scaling.data[add_idx] = params["scaling"]
+        self._mcmc_append_params(params)
+        self.refresh_parameters_from_optimizer(self.reset_optimizer_state(inds=add_idx))
+        return num_gs
+
+    def mcmc_densify(self):
+        dead_mask = (self.get_opacity <= self.mcmc_min_opacity).squeeze(-1)
+        relocated = self.relocate_gs(dead_mask)
+        added = self.add_new_gs()
+        pruned = self.mcmc_prune()
+        return relocated, added, pruned
+
+    @torch.no_grad()
+    def mcmc_prune(self):
+        if self.get_xyz.shape[0] == 0:
+            return 0
+        if self.mcmc_prune_min_opacity > 0.0:
+            prune_mask = (self.get_opacity < self.mcmc_prune_min_opacity).squeeze(-1)
+        else:
+            prune_mask = torch.zeros((self.get_xyz.shape[0],), dtype=torch.bool, device=self.get_xyz.device)
+        if self.mcmc_cap_max is not None and self.mcmc_cap_max > 0 and self.get_xyz.shape[0] > self.mcmc_cap_max:
+            extra = int(self.get_xyz.shape[0] - self.mcmc_cap_max)
+            score = self._mcmc_prune_score()
+            _, low_idx = torch.topk(score, extra, largest=False)
+            prune_mask[low_idx] = True
+        pruned = int(prune_mask.sum().item())
+        if pruned > 0 and pruned < self.get_xyz.shape[0]:
+            self.prune_points(prune_mask)
+        return pruned
+
+    @torch.no_grad()
+    def _mcmc_prune_score(self):
+        opacity = self.get_opacity.squeeze(-1)
+        if getattr(self, "mcmc_prune_score", "opacity") == "contrib":
+            visible = self.denom.squeeze(-1).clamp_min(1.0)
+            grad = (self.xyz_gradient_accum.squeeze(-1) / visible).nan_to_num(0.0)
+            grad_norm = grad / grad.detach().quantile(0.95).clamp_min(1e-8)
+            visibility = (visible / visible.detach().max().clamp_min(1.0)).clamp(0.05, 1.0)
+            return opacity * visibility * (0.25 + grad_norm.clamp(0.0, 4.0))
+        return opacity
+
+    @torch.no_grad()
+    def add_mcmc_noise(self):
+        if self.mcmc_noise_lr <= 0.0 or self.current_xyz_lr <= 0.0 or self.get_xyz.shape[0] == 0:
+            return
+        L = build_scaling_rotation(self.get_scaling, self.get_rotation)
+        actual_covariance = L @ L.transpose(1, 2)
+
+        def op_sigmoid(x, k=100, x0=0.995):
+            return 1 / (1 + torch.exp(-k * (x - x0)))
+
+        noise = torch.randn_like(self._xyz) * op_sigmoid(1 - self.get_opacity) * self.mcmc_noise_lr * self.current_xyz_lr
+        noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+        self._xyz.add_(noise)
+
+    def regularization_loss(self, **kwargs):
+        loss = 0.0
+        if self.mcmc_opacity_reg > 0.0:
+            loss = loss + self.mcmc_opacity_reg * torch.abs(self.get_opacity).mean()
+        if self.mcmc_scale_reg > 0.0:
+            loss = loss + self.mcmc_scale_reg * torch.abs(self.get_scaling).mean()
+        return loss
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -558,6 +799,18 @@ class DRKModel(GaussianModel):
 
         self.cache_sort = False
         self.tile_culling = False
+        self.use_mcmc = False
+        self.mcmc_strategy = "replace"
+        self.mcmc_start_iter = -1
+        self.mcmc_end_iter = -1
+        self.mcmc_cap_max = -1
+        self.mcmc_growth_rate = 1.05
+        self.mcmc_min_opacity = 0.005
+        self.mcmc_noise_lr = 0.0
+        self.mcmc_opacity_reg = 0.0
+        self.mcmc_scale_reg = 0.0
+        self.mcmc_prune_min_opacity = 0.0
+        self.mcmc_prune_score = "opacity"
 
     def train(self):
         self.training = True
@@ -601,7 +854,7 @@ class DRKModel(GaussianModel):
         return self.final_min_opacity_pruning
 
     def regularization_loss(self, **kwargs):
-        return 0.
+        return super().regularization_loss(**kwargs)
     
     @property
     def get_acutance(self):
@@ -713,6 +966,18 @@ class DRKModel(GaussianModel):
         self.densification_interval = training_args.densification_interval
         self.opacity_reset_interval = training_args.opacity_reset_interval
         self.percent_dense = training_args.percent_drk_dense
+        self.use_mcmc = getattr(training_args, "use_mcmc", False)
+        self.mcmc_strategy = getattr(training_args, "mcmc_strategy", "replace")
+        self.mcmc_start_iter = getattr(training_args, "mcmc_start_iter", -1)
+        self.mcmc_end_iter = getattr(training_args, "mcmc_end_iter", -1)
+        self.mcmc_cap_max = getattr(training_args, "mcmc_cap_max", -1)
+        self.mcmc_growth_rate = getattr(training_args, "mcmc_growth_rate", 1.05)
+        self.mcmc_min_opacity = getattr(training_args, "mcmc_min_opacity", 0.005)
+        self.mcmc_noise_lr = getattr(training_args, "mcmc_noise_lr", 0.0)
+        self.mcmc_opacity_reg = getattr(training_args, "mcmc_opacity_reg", 0.0)
+        self.mcmc_scale_reg = getattr(training_args, "mcmc_scale_reg", 0.0)
+        self.mcmc_prune_min_opacity = getattr(training_args, "mcmc_prune_min_opacity", 0.0)
+        self.mcmc_prune_score = getattr(training_args, "mcmc_prune_score", "opacity")
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.opacity_gradient_accum = torch.zeros_like(self.xyz_gradient_accum)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -770,6 +1035,7 @@ class DRKModel(GaussianModel):
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
+                self.current_xyz_lr = lr
             if param_group["name"] == "acutance":
                 lr = self.acu_scheduler_args(iteration)
                 param_group['lr'] = lr
@@ -856,6 +1122,55 @@ class DRKModel(GaussianModel):
         if not self.no_recenter:
             self.recenter()
 
+    def refresh_parameters_from_optimizer(self, optimizable_tensors):
+        super().refresh_parameters_from_optimizer(optimizable_tensors)
+        self._acutance = optimizable_tensors["acutance"]
+        self._thetas = optimizable_tensors["thetas"]
+        self._l1l2_rates = optimizable_tensors["l1l2_rates"]
+
+    def _mcmc_updated_params(self, idxs, ratio):
+        params = super()._mcmc_updated_params(idxs, ratio)
+        params["acutance"] = self._acutance[idxs]
+        params["thetas"] = self._thetas[idxs]
+        params["l1l2_rates"] = self._l1l2_rates[idxs]
+        return params
+
+    def _mcmc_assign_params(self, indices, params):
+        super()._mcmc_assign_params(indices, params)
+        self._acutance.data[indices] = params["acutance"]
+        self._thetas.data[indices] = params["thetas"]
+        self._l1l2_rates.data[indices] = params["l1l2_rates"]
+
+    def _mcmc_append_params(self, params):
+        self.densification_postfix(
+            params["xyz"],
+            params["f_dc"],
+            params["f_rest"],
+            params["opacity"],
+            params["acutance"],
+            params["scaling"],
+            params["rotation"],
+            params["thetas"],
+            params["l1l2_rates"],
+        )
+
+    @torch.no_grad()
+    def add_mcmc_noise(self):
+        if self.mcmc_noise_lr <= 0.0 or self.current_xyz_lr <= 0.0 or self.get_xyz.shape[0] == 0:
+            return
+
+        def op_sigmoid(x, k=100, x0=0.995):
+            return 1 / (1 + torch.exp(-k * (x - x0)))
+
+        rot = self.get_rotation.reshape(-1, 3, 3)
+        tangent_scale = self.get_scaling.mean(dim=-1)
+        local_noise = torch.randn_like(self._xyz)
+        local_noise[:, :2] = local_noise[:, :2] * tangent_scale[:, None]
+        local_noise[:, 2] = local_noise[:, 2] * (0.2 * tangent_scale)
+        noise = torch.bmm(rot, local_noise.unsqueeze(-1)).squeeze(-1)
+        noise = noise * op_sigmoid(1 - self.get_opacity) * self.mcmc_noise_lr * self.current_xyz_lr
+        self._xyz.add_(noise)
+
     @torch.no_grad()
     def recenter(self):
         thetas = self.get_thetas * torch.pi * 2
@@ -940,10 +1255,22 @@ class DRKModel(GaussianModel):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        # Opacity-gradient driven densification: combine position and opacity gradients
+        opacity_grads = self.opacity_gradient_accum / self.denom
+        opacity_grads[opacity_grads.isnan()] = 0.0
+        combined_grads = grads + self.opacity_densify_grad_threshold * opacity_grads
+
+        self.densify_and_clone(combined_grads, max_grad, extent)
+        self.densify_and_split(combined_grads, max_grad, extent)
 
         prune_mask = (self.get_sharpen_opacity < min_opacity).squeeze()
+        # Visibility-aware pruning: also prune Gaussians with low visibility
+        if self.denom.shape[0] == prune_mask.shape[0]:
+            visibility_ratio = self.denom.squeeze() / max(self.iteration - self.key_stages[0], 1)
+            low_visibility = visibility_ratio < 0.02
+            low_opacity = (self.get_sharpen_opacity < 0.1).squeeze()
+            floater_mask = torch.logical_and(low_visibility, low_opacity)
+            prune_mask = torch.logical_or(prune_mask, floater_mask)
         if max_screen_size:
             if extent == 0.0:
                 extent = 1e2

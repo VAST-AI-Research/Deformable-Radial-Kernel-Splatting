@@ -400,18 +400,17 @@ renderCUDA(
 			const float * scale = collected_scales + KERNEL_K*j;
 			float uv_l2norm = uv.x * uv.x + uv.y * uv.y;
 			// Numerical Protection!
-			uv_l2norm = max(uv_l2norm, 0.00000001);
+			uv_l2norm = max(uv_l2norm, 0.00000001f);
 			float theta = atan2f(uv.y, uv.x);
 			theta = theta < 0.f? theta + 2.0f * PI: theta;
-			theta = min(theta / (2.0f * PI), 1.0f);
+			theta = fminf(theta * (0.5f / PI), 1.0f);
 			const float * thetas_array = collected_thetas + KERNEL_K*j;
-			int k = 0;
-			for(int ii=0; ii<KERNEL_K-1; ii++)
-				k += thetas_array[ii]>=theta? 0: 1;
+			int k = branchless_segment_search(theta, thetas_array);
 			float theta_l = k==0? 0.0f: thetas_array[k-1];
 			float theta_r = thetas_array[k];
-			float linear_rate = (theta - theta_l) / (theta_r - theta_l);
-			float rate = 0.5f * (cosf((1.0f - linear_rate) * PI) + 1);
+			float inv_theta_span = __frcp_rn(theta_r - theta_l);
+			float linear_rate = (theta - theta_l) * inv_theta_span;
+			float rate = 0.5f * (__cosf((1.0f - linear_rate) * PI) + 1.0f);
 			float scale_left = scale[k];
 			float scale_right = k==(KERNEL_K-1)? scale[0]: scale[k+1];
 
@@ -420,18 +419,21 @@ renderCUDA(
 			float2 e1 = kernel_vec[k];
 			float2 e2 = kernel_vec[k==(KERNEL_K-1)? 0: k+1];
 			float delta = e1.x * e2.y - e1.y * e2.x;
-			delta = copysignf(max(fabsf(delta), 0.0000001f), delta);
-			float2 uv_t = {(e2.y * uv.x - e2.x * uv.y) / delta, (- e1.y * uv.x + e1.x * uv.y) / delta};
+			delta = copysignf(fmaxf(fabsf(delta), 0.0000001f), delta);
+			float inv_delta = __frcp_rn(delta);
+			float2 uv_t = {(e2.y * uv.x - e2.x * uv.y) * inv_delta, (- e1.y * uv.x + e1.x * uv.y) * inv_delta};
 
 			// Step 4. Kernel function (theta, uv_norm -> kernel_opacity)
 			float l1l2_rate = collected_l1l2rate[j];
 			float uvt_l1norm = fabsf(uv_t.x) + fabsf(uv_t.y);
 			uvt_l1norm = uvt_l1norm * uvt_l1norm * 0.5f;
-			uvt_l1norm = max(uvt_l1norm, 0.00000001);
-			float uvt_l2norm = uv_l2norm * (rate / (scale_right*scale_right) + (1 - rate) / (scale_left*scale_left)) * 0.5f;
-			uvt_l2norm = max(uvt_l2norm, 0.00000001);
-			float uv_norm = l1l2_rate * uvt_l1norm + (1 - l1l2_rate) * uvt_l2norm;
-			float kernel_opacity = exp(- uv_norm);
+			uvt_l1norm = fmaxf(uvt_l1norm, 0.00000001f);
+			float inv_sl2 = __frcp_rn(scale_left*scale_left);
+			float inv_sr2 = __frcp_rn(scale_right*scale_right);
+			float uvt_l2norm = uv_l2norm * (rate * inv_sr2 + (1.0f - rate) * inv_sl2) * 0.5f;
+			uvt_l2norm = fmaxf(uvt_l2norm, 0.00000001f);
+			float uv_norm = l1l2_rate * uvt_l1norm + (1.0f - l1l2_rate) * uvt_l2norm;
+			float kernel_opacity = __expf(- uv_norm);
 
 			// Step 5. Sharpening
 			const float k_acu = collected_acutance[j];
@@ -459,9 +461,10 @@ renderCUDA(
 
 			// Step 6. Low pass filter
 			float cos_dn = collected_op_cos_n[j];
-			float2 res_2d = {(xy.x - pixf.x) / cos_dn, (xy.y - pixf.y) / cos_dn};
+			float inv_cos_dn = __frcp_rn(cos_dn);
+			float2 res_2d = {(xy.x - pixf.x) * inv_cos_dn, (xy.y - pixf.y) * inv_cos_dn};
 			float dist_2d_norm = FilterInvSquare * (res_2d.x * res_2d.x + res_2d.y * res_2d.y);
-			float G_lps = exp(-0.5f * dist_2d_norm);
+			float G_lps = __expf(-0.5f * dist_2d_norm);
 			float alpha_lpf = opacity * G_lps;
 			bool filter_cond = (alpha < alpha_lpf) & LOW_PASS_FILTER;
 			alpha = filter_cond? alpha_lpf: alpha;
@@ -514,17 +517,17 @@ renderCUDA(
 
 			if(filter_cond){
 				float gs_dir[3] = {collected_op[j * 3], collected_op[j * 3 + 1], collected_op[j * 3 + 2]};
-				float gs_dir_norm = sqrtf(max(gs_dir[0] * gs_dir[0] + gs_dir[1] * gs_dir[1] + gs_dir[2] * gs_dir[2], 0.0000001f));
+				float gs_dir_norm = sqrtf(fmaxf(gs_dir[0] * gs_dir[0] + gs_dir[1] * gs_dir[1] + gs_dir[2] * gs_dir[2], 0.0000001f));
+				float inv_gs_dir_norm = __frcp_rn(gs_dir_norm);
 				for(int ii=0; ii<3; ii++)
-					gs_dir[ii] /= gs_dir_norm;
-				float gsdir_dot_n = collected_op_n[j] / gs_dir_norm;
-				// // Half the gradient
-				// dL_dalpha *= 0.5f;
+					gs_dir[ii] *= inv_gs_dir_norm;
+				float gsdir_dot_n = collected_op_n[j] * inv_gs_dir_norm;
 				// Backward for mean3D
-				float dL_dscreenx = dL_dalpha * (- alpha_lpf * FilterInvSquare * res_2d.x / cos_dn);
-				float dL_dscreeny = dL_dalpha * (- alpha_lpf * FilterInvSquare * res_2d.y / cos_dn);
-				float dscreenx_dcamerax = focal_x / pix_depth;
-				float dscreeny_dcameray = focal_y / pix_depth;
+				float dL_dscreenx = dL_dalpha * (- alpha_lpf * FilterInvSquare * res_2d.x * inv_cos_dn);
+				float dL_dscreeny = dL_dalpha * (- alpha_lpf * FilterInvSquare * res_2d.y * inv_cos_dn);
+				float inv_pix_depth = __frcp_rn(pix_depth);
+				float dscreenx_dcamerax = focal_x * inv_pix_depth;
+				float dscreeny_dcameray = focal_y * inv_pix_depth;
 				float dcamerax_dmean3D[3] = {viewmatrix[0], viewmatrix[1], viewmatrix[2]};
 				float dcameray_dmean3D[3] = {viewmatrix[4], viewmatrix[5], viewmatrix[6]};
 				float dcameraz_dmean3D[3] = {viewmatrix[8], viewmatrix[9], viewmatrix[10]};
@@ -554,9 +557,10 @@ renderCUDA(
 			else {
 				////////////////////////////////////////////////////////////////////
 				// UV Backward for mean3D
-				float dtu_over_dn = dir_dot_tu / dir_dot_n;
+				float inv_dir_dot_n = __frcp_rn(dir_dot_n);
+				float dtu_over_dn = dir_dot_tu * inv_dir_dot_n;
 				float du_dmean3D[3] = {Rs[2] * dtu_over_dn - Rs[0], Rs[5] * dtu_over_dn - Rs[3], Rs[8] * dtu_over_dn - Rs[6]};
-				float dtv_over_dn = dir_dot_tv / dir_dot_n;
+				float dtv_over_dn = dir_dot_tv * inv_dir_dot_n;
 				float dv_dmean3D[3] = {Rs[2] * dtv_over_dn - Rs[1], Rs[5] * dtv_over_dn - Rs[4], Rs[8] * dtv_over_dn - Rs[7]};
 				// UV Backward for R
 				float tangent[3] = {ray_t*dir[0] - collected_op[j*3], ray_t*dir[1] - collected_op[j*3+1], ray_t*dir[2] - collected_op[j*3+2]};
@@ -571,28 +575,31 @@ renderCUDA(
 					dv_dR[3*ii+2] = - dtv_over_dn * tangent[ii];
 				}
 				// rayt Backward for depth (ray_t)
+				float inv_dir_dot_n_sq = inv_dir_dot_n * inv_dir_dot_n;
 				float drayt_dn[3] = {
-					(collected_op[j*3]   * dir_dot_n - collected_op_n[j] * dir[0]) / dir_dot_n / dir_dot_n,
-					(collected_op[j*3+1] * dir_dot_n - collected_op_n[j] * dir[1]) / dir_dot_n / dir_dot_n,
-					(collected_op[j*3+2] * dir_dot_n - collected_op_n[j] * dir[2]) / dir_dot_n / dir_dot_n
+					(collected_op[j*3]   * dir_dot_n - collected_op_n[j] * dir[0]) * inv_dir_dot_n_sq,
+					(collected_op[j*3+1] * dir_dot_n - collected_op_n[j] * dir[1]) * inv_dir_dot_n_sq,
+					(collected_op[j*3+2] * dir_dot_n - collected_op_n[j] * dir[2]) * inv_dir_dot_n_sq
 				};
-				float drayt_dmean3D[3] = {normal[0] / dir_dot_n, normal[1] / dir_dot_n, normal[2] / dir_dot_n};
+				float drayt_dmean3D[3] = {normal[0] * inv_dir_dot_n, normal[1] * inv_dir_dot_n, normal[2] * inv_dir_dot_n};
 				// Backward for UV_T w.r.t UV, theta, scale
-				float dut_du =  e2.y / delta;
-				float dvt_du = -e1.y / delta;
-				float dut_dv = -e2.x / delta;
-				float dvt_dv =  e1.x / delta;
-				float sin2 = sinf(2*PI*(theta_r-theta_l));
-				float cos2 = cosf(2*PI*(theta_r-theta_l));
-				float twopi_over_tan = 2 * PI * cos2 / sin2;
+				float dut_du =  e2.y * inv_delta;
+				float dvt_du = -e1.y * inv_delta;
+				float dut_dv = -e2.x * inv_delta;
+				float dvt_dv =  e1.x * inv_delta;
+				float theta_span_2pi = 2.0f * PI * (theta_r - theta_l);
+				float sin2, cos2;
+				__sincosf(theta_span_2pi, &sin2, &cos2);
+				float inv_sin2 = __frcp_rn(sin2);
+				float twopi_over_tan = 2.0f * PI * cos2 * inv_sin2;
 				float dut_dtheta_left  =   uv_t.x * twopi_over_tan;
-				float dvt_dtheta_left  = - 2 * PI * scale_left * uv_t.x / (scale_right * sin2);
-				float dut_dtheta_right =   2 * PI * scale_right * uv_t.y / (scale_left * sin2);
+				float dvt_dtheta_left  = - 2.0f * PI * scale_left * uv_t.x * __frcp_rn(scale_right) * inv_sin2;
+				float dut_dtheta_right =   2.0f * PI * scale_right * uv_t.y * __frcp_rn(scale_left) * inv_sin2;
 				float dvt_dtheta_right = - uv_t.y * twopi_over_tan;
-				float dut_dscale_left  = - uv_t.x / scale_left;
+				float dut_dscale_left  = - uv_t.x * __frcp_rn(scale_left);
 				float dvt_dscale_left  = 0.f;
 				float dut_dscale_right = 0.f;
-				float dvt_dscale_right = - uv_t.y / scale_right;
+				float dvt_dscale_right = - uv_t.y * __frcp_rn(scale_right);
 				float duvtl1_dut = copysignf(uv_t.y, uv_t.x) + uv_t.x;
 				float duvtl1_dvt = copysignf(uv_t.x, uv_t.y) + uv_t.y;
 				// Backward for uvt_l1norm w.r.t UV, theta, scale
@@ -603,22 +610,22 @@ renderCUDA(
 				float duvtl1_dscale_left  = duvtl1_dut * dut_dscale_left  + duvtl1_dvt * dvt_dscale_left;
 				float duvtl1_dscale_right = duvtl1_dut * dut_dscale_right + duvtl1_dvt * dvt_dscale_right;
 				// Backward for rate w.r.t UV, thetas
-				float one_over_thetarml = 1 / (theta_r - theta_l);
-				float drate_dlinear = .5 * PI * sinf(PI * linear_rate);
+				float one_over_thetarml = inv_theta_span;
+				float drate_dlinear = .5f * PI * __sinf(PI * linear_rate);
 				float drate_dtheta = one_over_thetarml * drate_dlinear;
-				float drate_du = -uv.y / uv_l2norm / (2.0f * PI) * drate_dtheta;
-				float drate_dv =  uv.x / uv_l2norm / (2.0f * PI) * drate_dtheta;
+				float drate_du = -uv.y / uv_l2norm * (0.5f / PI) * drate_dtheta;
+				float drate_dv =  uv.x / uv_l2norm * (0.5f / PI) * drate_dtheta;
 				float drate_dthetas_left  = (theta - theta_r) * one_over_thetarml * one_over_thetarml * drate_dlinear;
 				float drate_dthetas_right = (theta_l - theta) * one_over_thetarml * one_over_thetarml * drate_dlinear;
 				// Backward for uvt_l2norm w.r.t UV, theta, scale
-				float duvtl2_drate = 0.5f * uv_l2norm * (1 / (scale_right*scale_right) - 1 / (scale_left*scale_left));
-				float rated_scale = rate / (scale_right*scale_right) + (1-rate) / (scale_left*scale_left);
+				float duvtl2_drate = 0.5f * uv_l2norm * (inv_sr2 - inv_sl2);
+				float rated_scale = rate * inv_sr2 + (1.0f - rate) * inv_sl2;
 				float duvtl2_du = uv.x * rated_scale + duvtl2_drate * drate_du;
 				float duvtl2_dv = uv.y * rated_scale + duvtl2_drate * drate_dv;
 				float duvtl2_dstheta_left  = duvtl2_drate * drate_dthetas_left;
 				float duvtl2_dstheta_right = duvtl2_drate * drate_dthetas_right;
-				float duvtl2_dscale_left  = - uv_l2norm * (1 - rate) / (scale_left *scale_left *scale_left);
-				float duvtl2_dscale_right = - uv_l2norm * rate       / (scale_right*scale_right*scale_right);
+				float duvtl2_dscale_left  = - uv_l2norm * (1.0f - rate) * inv_sl2 * __frcp_rn(scale_left);
+				float duvtl2_dscale_right = - uv_l2norm * rate * inv_sr2 * __frcp_rn(scale_right);
 				// Backward for uvt_norm w.r.t UV
 				float duvnorm_duvtl1 = l1l2_rate;
 				float duvnorm_duvtl2 = (1 - l1l2_rate);

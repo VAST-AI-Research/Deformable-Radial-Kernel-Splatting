@@ -99,6 +99,7 @@ class OptimizationParams(ParamGroup):
         # Args for DRK
         self.cache_sort = False
         self.tile_culling = False
+        self.skip_densify_stats_after = True
         self.opacity_drk_lr = 1e-2
         self.acutance_drk = 5e-3
         self.acutance_drk_final = 5e-5
@@ -115,6 +116,34 @@ class OptimizationParams(ParamGroup):
         self.is_unbounded = False
         self.no_recenter = False
         self.no_resetopacity = False
+        self.use_mcmc = False
+        self.mcmc_strategy = "replace"
+        self.mcmc_start_iter = -1
+        self.mcmc_end_iter = -1
+        self.mcmc_cap_max = -1
+        self.mcmc_growth_rate = 1.05
+        self.mcmc_min_opacity = 0.005
+        self.mcmc_noise_lr = 0.0
+        self.mcmc_opacity_reg = 0.0
+        self.mcmc_scale_reg = 0.0
+        self.mcmc_prune_min_opacity = 0.0
+        self.mcmc_prune_score = "opacity"
+        self.lambda_alpha_mask = 0.0
+        self.alpha_mask_from_iter = -1
+        self.alpha_mask_until_iter = -1
+        self.alpha_mask_warmup = 0
+        self.final_prune_target = -1
+        self.final_prune_score = "visible_area_sharp"
+        self.final_prune_split = "train"
+
+        # Multi-scale anti-aliasing loss
+        self.lambda_multiscale = 0.0
+        self.multiscale_scales = "0.5,0.25"
+        # Opacity regularization for floater suppression
+        self.lambda_opacity_reg = 0.0
+        self.opacity_reg_from_iter = 500
+        # Depth distortion loss for reducing floaters
+        self.lambda_depth_distortion = 0.0
 
         self.position_lr_init_small = 1.6e-4
         self.position_lr_final_small = 1.6e-6
