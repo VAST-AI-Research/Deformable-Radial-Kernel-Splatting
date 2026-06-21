@@ -125,6 +125,8 @@ class GaussianModel:
         self.mcmc_end_iter = -1
         self.mcmc_cap_max = -1
         self.mcmc_growth_rate = 1.05
+        self.mcmc_grad_weight = 1.5
+        self.mcmc_scale_weight = 0.5
         self.mcmc_min_opacity = 0.005
         self.mcmc_noise_lr = 0.0
         self.mcmc_opacity_reg = 0.0
@@ -237,6 +239,8 @@ class GaussianModel:
         self.mcmc_end_iter = getattr(training_args, "mcmc_end_iter", -1)
         self.mcmc_cap_max = getattr(training_args, "mcmc_cap_max", -1)
         self.mcmc_growth_rate = getattr(training_args, "mcmc_growth_rate", 1.05)
+        self.mcmc_grad_weight = getattr(training_args, "mcmc_grad_weight", 0.0)
+        self.mcmc_scale_weight = getattr(training_args, "mcmc_scale_weight", 0.0)
         self.mcmc_min_opacity = getattr(training_args, "mcmc_min_opacity", 0.005)
         self.mcmc_noise_lr = getattr(training_args, "mcmc_noise_lr", 0.0)
         self.mcmc_opacity_reg = getattr(training_args, "mcmc_opacity_reg", 0.0)
@@ -529,6 +533,29 @@ class GaussianModel:
         )
 
     @torch.no_grad()
+    def _mcmc_source_probs(self, indices=None):
+        """Sampling weight for MCMC clone/relocate sources. Default = opacity (3DGS-MCMC).
+        With mcmc_grad_weight>0, multiply by a factor of the per-primitive ABSOLUTE view-space
+        gradient (xyz_gradient_accum is accumulated from the CUDA abs-grad densify buffer, AbsGS):
+        biases new primitives toward UNDER-RECONSTRUCTED regions (e.g. blurry distant areas where
+        one large primitive spans high-frequency content) so detail gets sculpted, not just the
+        already-opaque near field."""
+        op = self.get_opacity.squeeze(-1)
+        op = op[indices] if indices is not None else op
+        w = float(getattr(self, "mcmc_grad_weight", 0.0))
+        if w > 0.0 and self.denom.numel() > 0:
+            g = (self.xyz_gradient_accum.squeeze(-1) / self.denom.squeeze(-1).clamp_min(1.0)).nan_to_num(0.0)
+            g = g[indices] if indices is not None else g
+            gn = g / g.quantile(0.95).clamp_min(1e-12)          # normalize by 95th percentile
+            if float(getattr(self, "mcmc_scale_weight", 0.0)) > 0.0:   # also favor large primitives
+                s = self.get_scaling.max(dim=1).values
+                s = s[indices] if indices is not None else s
+                sn = s / s.quantile(0.95).clamp_min(1e-12)
+                gn = gn + float(self.mcmc_scale_weight) * sn
+            return op * (1.0 + w * gn.clamp(0.0, 10.0))
+        return op
+
+    @torch.no_grad()
     def relocate_gs(self, dead_mask):
         if dead_mask.sum() == 0:
             return 0
@@ -538,7 +565,7 @@ class GaussianModel:
         if alive_indices.shape[0] == 0:
             return 0
 
-        probs = self.get_opacity[alive_indices, 0]
+        probs = self._mcmc_source_probs(alive_indices)
         reinit_idx, ratio = self._sample_mcmc_sources(probs, dead_indices.shape[0], alive_indices=alive_indices)
         params = self._mcmc_updated_params(reinit_idx, ratio)
         self._mcmc_assign_params(dead_indices, params)
@@ -558,7 +585,7 @@ class GaussianModel:
         if num_gs <= 0:
             return 0
 
-        add_idx, ratio = self._sample_mcmc_sources(self.get_opacity.squeeze(-1), num_gs)
+        add_idx, ratio = self._sample_mcmc_sources(self._mcmc_source_probs(), num_gs)
         params = self._mcmc_updated_params(add_idx, ratio)
         self._opacity.data[add_idx] = params["opacity"]
         self._scaling.data[add_idx] = params["scaling"]
@@ -805,6 +832,8 @@ class DRKModel(GaussianModel):
         self.mcmc_end_iter = -1
         self.mcmc_cap_max = -1
         self.mcmc_growth_rate = 1.05
+        self.mcmc_grad_weight = 1.5
+        self.mcmc_scale_weight = 0.5
         self.mcmc_min_opacity = 0.005
         self.mcmc_noise_lr = 0.0
         self.mcmc_opacity_reg = 0.0
@@ -972,6 +1001,8 @@ class DRKModel(GaussianModel):
         self.mcmc_end_iter = getattr(training_args, "mcmc_end_iter", -1)
         self.mcmc_cap_max = getattr(training_args, "mcmc_cap_max", -1)
         self.mcmc_growth_rate = getattr(training_args, "mcmc_growth_rate", 1.05)
+        self.mcmc_grad_weight = getattr(training_args, "mcmc_grad_weight", 0.0)
+        self.mcmc_scale_weight = getattr(training_args, "mcmc_scale_weight", 0.0)
         self.mcmc_min_opacity = getattr(training_args, "mcmc_min_opacity", 0.005)
         self.mcmc_noise_lr = getattr(training_args, "mcmc_noise_lr", 0.0)
         self.mcmc_opacity_reg = getattr(training_args, "mcmc_opacity_reg", 0.0)

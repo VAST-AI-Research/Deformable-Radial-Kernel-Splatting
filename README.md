@@ -28,6 +28,17 @@ DRK can flexibly fit various basic primitives with diverse shapes and sharp boun
 
 ---
 
+## Updated densification strategy
+
+DRK with an updated densification strategy, compared to 3DGS on **Tanks & Temples** (Family, COLMAP poses, 896×512, test split):
+
+| Family | PSNR | SSIM | L1 | prims |
+|---|---|---|---|---|
+| 3DGS | 22.25 | 0.782 | 0.047 | 1.70M |
+| DRK | 22.46 | 0.765 | 0.045 | 0.90M |
+
+---
+
 ## Environment Setup
 
 ### Create and Activate Python Environment

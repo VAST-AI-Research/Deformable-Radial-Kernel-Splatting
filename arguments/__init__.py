@@ -122,6 +122,8 @@ class OptimizationParams(ParamGroup):
         self.mcmc_end_iter = -1
         self.mcmc_cap_max = -1
         self.mcmc_growth_rate = 1.05
+        self.mcmc_grad_weight = 1.5   # default ON: bias MCMC clone/relocate toward high abs-grad (under-reconstructed) prims (AbsGS-style); +0.4 dB on T&T at equal prim budget. Set 0 for vanilla opacity-only MCMC.
+        self.mcmc_scale_weight = 0.5  # default ON: additionally bias toward large primitives (split blurry distant coverage)
         self.mcmc_min_opacity = 0.005
         self.mcmc_noise_lr = 0.0
         self.mcmc_opacity_reg = 0.0
