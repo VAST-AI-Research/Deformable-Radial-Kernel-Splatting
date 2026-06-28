@@ -56,12 +56,23 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool cache_sort,
 	const bool tile_culling,
+	const bool render_aux,
+	const bool return_radii,
 	const bool debug)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
-  
+  TORCH_CHECK(scales.dim() == 2 && scales.size(1) == KERNEL_K, "DRK scales K does not match compiled KERNEL_K");
+  TORCH_CHECK(thetas.dim() == 2 && thetas.size(1) == KERNEL_K, "DRK thetas K does not match compiled KERNEL_K");
+#if DRK_SCREEN_SPACE_L1_KERNEL
+  TORCH_CHECK(!render_aux, "DRK_SCREEN_SPACE_L1_KERNEL is RGB-only; call with render_aux=False");
+  TORCH_CHECK(!cache_sort, "DRK_SCREEN_SPACE_L1_KERNEL does not support cache_sort");
+  TORCH_CHECK(!tile_culling, "DRK_SCREEN_SPACE_L1_KERNEL does not support tile_culling");
+  TORCH_CHECK(DRK_FORCE_L1_KERNEL && DRK_FORCE_ACUTANCE_ONE_KERNEL && !LOW_PASS_FILTER,
+      "DRK_SCREEN_SPACE_L1_KERNEL requires force-L1, force-acutance-one, and low-pass off");
+#endif
+
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
@@ -69,11 +80,13 @@ RasterizeGaussiansCUDA(
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-  torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
-  torch::Tensor out_normal = torch::full({3, H, W}, 0.0, float_opts);
-  torch::Tensor out_alpha = torch::full({1, H, W}, 0.0, float_opts);
-  torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+  torch::Tensor out_color = torch::empty({NUM_CHANNELS, H, W}, float_opts);
+  torch::Tensor out_depth = render_aux ? torch::empty({1, H, W}, float_opts) : torch::empty({0}, float_opts);
+  torch::Tensor out_normal = render_aux ? torch::empty({3, H, W}, float_opts) : torch::empty({0}, float_opts);
+  torch::Tensor out_alpha = render_aux ? torch::empty({1, H, W}, float_opts) : torch::empty({0}, float_opts);
+  torch::Tensor radii = return_radii
+      ? torch::empty({P}, int_opts)
+      : torch::empty({0}, int_opts);
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -85,7 +98,17 @@ RasterizeGaussiansCUDA(
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
   int rendered = 0;
-  if(P != 0)
+  if(P == 0)
+  {
+    out_color.zero_();
+    if (render_aux)
+    {
+      out_depth.zero_();
+      out_normal.zero_();
+      out_alpha.zero_();
+    }
+  }
+  else
   {
 	  int M = 0;
 	  if(sh.size(0) != 0)
@@ -117,13 +140,14 @@ RasterizeGaussiansCUDA(
 		tan_fovy,
 		prefiltered,
 		out_color.contiguous().data<float>(),
-		out_depth.contiguous().data<float>(),
-		out_normal.contiguous().data<float>(),
-		out_alpha.contiguous().data<float>(),
+		render_aux ? out_depth.contiguous().data<float>() : nullptr,
+		render_aux ? out_normal.contiguous().data<float>() : nullptr,
+		render_aux ? out_alpha.contiguous().data<float>() : nullptr,
 
 		cache_sort,
 		tile_culling,
-		radii.contiguous().data<int>(),
+		return_radii ? radii.contiguous().data<int>() : nullptr,
+		render_aux,
 		debug);
   }
   return std::make_tuple(rendered, out_color, out_depth, out_normal, out_alpha, radii, geomBuffer, binningBuffer, imgBuffer);
@@ -173,6 +197,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool debug)
 {
   const int P = means3D.size(0);
+  TORCH_CHECK(scales.dim() == 2 && scales.size(1) == KERNEL_K, "DRK scales K does not match compiled KERNEL_K");
+  TORCH_CHECK(thetas.dim() == 2 && thetas.size(1) == KERNEL_K, "DRK thetas K does not match compiled KERNEL_K");
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
   

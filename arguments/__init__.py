@@ -101,6 +101,7 @@ class OptimizationParams(ParamGroup):
         self.tile_culling = False
         self.skip_densify_stats_after = True
         self.opacity_drk_lr = 1e-2
+        self.kernel_K = 8
         self.acutance_drk = 5e-3
         self.acutance_drk_final = 5e-5
         self.thetas_drk = 1e-2
@@ -112,17 +113,21 @@ class OptimizationParams(ParamGroup):
         self.rotation_drk_lr = 1e-2
         self.rotation_drk_lr_final = 1e-4
         self.percent_drk_dense = 1e-3
+        self.drk_init_scale_multiplier = 1.0
+        self.drk_init_scale_quantile = 0.5
         self.kernel_density = "dense"
         self.is_unbounded = False
         self.no_recenter = False
         self.no_resetopacity = False
+        self.keep_manual_densification_interval = False
+        self.keep_manual_opacity_reset_interval = False
         self.use_mcmc = False
         self.mcmc_strategy = "replace"
         self.mcmc_start_iter = -1
         self.mcmc_end_iter = -1
         self.mcmc_cap_max = -1
         self.mcmc_growth_rate = 1.05
-        self.mcmc_grad_weight = 1.5   # default ON: bias MCMC clone/relocate toward high abs-grad (under-reconstructed) prims (AbsGS-style); +0.4 dB on T&T at equal prim budget. Set 0 for vanilla opacity-only MCMC.
+        self.mcmc_grad_weight = 1.5   # default ON: bias MCMC clone/relocate toward high abs-grad (under-reconstructed) prims (AbsGS-style); +0.45 dB on T&T at equal prim budget. Set 0 for vanilla opacity-only MCMC.
         self.mcmc_scale_weight = 0.5  # default ON: additionally bias toward large primitives (split blurry distant coverage)
         self.mcmc_min_opacity = 0.005
         self.mcmc_noise_lr = 0.0
@@ -135,17 +140,75 @@ class OptimizationParams(ParamGroup):
         self.alpha_mask_until_iter = -1
         self.alpha_mask_warmup = 0
         self.final_prune_target = -1
+        self.final_prune_at_iter = -1
         self.final_prune_score = "visible_area_sharp"
         self.final_prune_split = "train"
 
+        # Large-primitive pruning + one-sided size regularization (kill non-physical big floaters)
+        self.prune_big_screen_px = 0.0
+        self.prune_big_world_scale_k = 0.0
+        self.prune_big_from_iter = 0
+        self.prune_big_combine = 'or'
+        self.prune_big_interval = 200
+        self.prune_big_ws_frac = 0.1
+        self.lambda_scale_size_reg = 0.0
+        self.scale_size_reg_target_k = 0.0
+
+        # Joint camera pose refinement (learned bundle adjustment; COLMAP unavailable)
+        self.pose_refine = False
+        self.pose_lr = 1e-3
+        self.pose_refine_from_iter = 300
+        self.pose_refine_until_iter = -1
+
         # Multi-scale anti-aliasing loss
         self.lambda_multiscale = 0.0
+        self.lambda_multiscale_ssim = 0.0
         self.multiscale_scales = "0.5,0.25"
+        self.train_focus_cameras = ""
+        self.train_focus_weight = 1.0
+        self.lambda_sh_rest_l2 = 0.0
+        self.sh_rest_l2_from_iter = -1
+        self.sh_rest_l2_until_iter = -1
         # Opacity regularization for floater suppression
         self.lambda_opacity_reg = 0.0
         self.opacity_reg_from_iter = 500
         # Depth distortion loss for reducing floaters
         self.lambda_depth_distortion = 0.0
+
+        # Progressive DRK shape targets for sharp polygonal extraction.
+        self.lambda_acutance_target = 0.0
+        self.target_acutance = 1.0
+        self.target_acutance_start = -1.0
+        self.acutance_target_from_iter = 15_000
+        self.acutance_target_until_iter = -1
+        self.acutance_target_warmup = 5_000
+        self.acutance_target_ramp = 0
+        self.lambda_l1l2_target = 0.0
+        self.target_l1l2_rate = 1.0
+        self.target_l1l2_rate_start = -1.0
+        self.l1l2_target_from_iter = 15_000
+        self.l1l2_target_until_iter = -1
+        self.l1l2_target_warmup = 5_000
+        self.l1l2_target_ramp = 0
+        self.lambda_opacity_target = 0.0
+        self.target_opacity = 1.0
+        self.opacity_target_from_iter = 15_000
+        self.opacity_target_until_iter = -1
+        self.opacity_target_warmup = 5_000
+        self.opacity_target_l1l2_gate = 0.0
+        self.opacity_target_l1l2_gate_width = 0.05
+        self.target_opacity_start = -1.0
+        self.opacity_target_ramp = 0
+        self.opacity_binarize = 0.0          # >0 => drive each prim's opacity to nearest extreme (0/1) about this threshold
+        self.opacity_prune_thresh = 0.0      # >0 => periodically prune prims with opacity < this (the binarized-to-0 ones)
+        self.opacity_prune_interval = 500
+        self.opacity_prune_from_iter = 0     # only start opacity pruning after this iter (avoid dumping prims all at once)
+        self.train_force_acutance = -1.0
+        self.train_force_l1l2_rate = -1.0
+        self.train_force_opacity = -1.0
+        self.train_render_sh_degree = -1
+        self.train_postprocess_shift_x = 0.0
+        self.train_postprocess_shift_y = 0.0
 
         self.position_lr_init_small = 1.6e-4
         self.position_lr_final_small = 1.6e-6

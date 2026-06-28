@@ -41,10 +41,57 @@ __device__ const float SH_C3[] = {
 	1.445305721320277f,
 	-0.5900435899266435f
 };
+__device__ const float SH_C4[] = {
+	2.5033429417967046f,
+	-1.7701307697799304f,
+	0.9461746957575601f,
+	-0.6690465435572892f,
+	0.10578554691520431f,
+	-0.6690465435572892f,
+	0.47308734787878004f,
+	-1.7701307697799304f,
+	0.6258357354491761f
+};
 
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
 	return ((v + 1.0) * S - 1.0) * 0.5;
+}
+
+__forceinline__ __device__ float drkProjectionCenterX(float W)
+{
+	const float offset = DRK_PIXEL_CENTER_OFFSET_APPLY_PROJECTION ? (float)DRK_PIXEL_CENTER_OFFSET_X : 0.0f;
+	return (W - 1.0f) * 0.5f + offset;
+}
+
+__forceinline__ __device__ float drkProjectionCenterY(float H)
+{
+	const float offset = DRK_PIXEL_CENTER_OFFSET_APPLY_PROJECTION ? (float)DRK_PIXEL_CENTER_OFFSET_Y : 0.0f;
+	return (H - 1.0f) * 0.5f + offset;
+}
+
+__forceinline__ __device__ float drkRayCenterX(float W)
+{
+	const float offset = DRK_PIXEL_CENTER_OFFSET_APPLY_RAY ? (float)DRK_PIXEL_CENTER_OFFSET_X : 0.0f;
+	return (W - 1.0f) * 0.5f + offset;
+}
+
+__forceinline__ __device__ float drkRayCenterY(float H)
+{
+	const float offset = DRK_PIXEL_CENTER_OFFSET_APPLY_RAY ? (float)DRK_PIXEL_CENTER_OFFSET_Y : 0.0f;
+	return (H - 1.0f) * 0.5f + offset;
+}
+
+__forceinline__ __device__ float ndc2PixX(float v, int S)
+{
+	const float offset = DRK_PIXEL_CENTER_OFFSET_APPLY_PROJECTION ? (float)DRK_PIXEL_CENTER_OFFSET_X : 0.0f;
+	return ndc2Pix(v, S) + offset;
+}
+
+__forceinline__ __device__ float ndc2PixY(float v, int S)
+{
+	const float offset = DRK_PIXEL_CENTER_OFFSET_APPLY_PROJECTION ? (float)DRK_PIXEL_CENTER_OFFSET_Y : 0.0f;
+	return ndc2Pix(v, S) + offset;
 }
 
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
@@ -56,6 +103,18 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 	rect_max = {
 		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
+	};
+}
+
+__forceinline__ __device__ void getRectFromBounds(float min_x, float min_y, float max_x, float max_y, uint2& rect_min, uint2& rect_max, dim3 grid)
+{
+	rect_min = {
+		min(grid.x, max((int)0, (int)(min_x / BLOCK_X))),
+		min(grid.y, max((int)0, (int)(min_y / BLOCK_Y)))
+	};
+	rect_max = {
+		min(grid.x, max((int)0, (int)((max_x + BLOCK_X - 1) / BLOCK_X))),
+		min(grid.y, max((int)0, (int)((max_y + BLOCK_Y - 1) / BLOCK_Y)))
 	};
 }
 
@@ -199,17 +258,12 @@ __forceinline__ __device__ int kernel_search_sorted(const float x, const float* 
     return low + 1;
 }
 
-// Branchless segment search for KERNEL_K=8
-// Uses predicated additions instead of branches for better warp coherence
+// Uses predicated additions instead of branches for better warp coherence.
 __forceinline__ __device__ int branchless_segment_search(const float theta, const float* thetas_array) {
 	int k = 0;
-	k += (thetas_array[0] < theta);
-	k += (thetas_array[1] < theta);
-	k += (thetas_array[2] < theta);
-	k += (thetas_array[3] < theta);
-	k += (thetas_array[4] < theta);
-	k += (thetas_array[5] < theta);
-	k += (thetas_array[6] < theta);
+#pragma unroll
+	for (int idx = 0; idx < KERNEL_K - 1; ++idx)
+		k += (thetas_array[idx] < theta);
 	return k;
 }
 
@@ -229,7 +283,7 @@ __forceinline__ __device__ bool warpFirstForId(int global_id) {
 }
 
 __forceinline__ __device__ float3 calculate_rayt(const float* viewmatrix, const float* cam_pos, const float* mean3D, const float focal_x, const float focal_y, const float* Rs, float2 pixf, float W, float H, bool filter_side, glm::vec3& intersect) {
-	glm::vec3 dir_camera = {(pixf.x - (W-1.0) * 0.5) / focal_x, (pixf.y - (H-1.0) * 0.5) / focal_y, 1.0f};
+	glm::vec3 dir_camera = {(pixf.x - drkRayCenterX(W)) / focal_x, (pixf.y - drkRayCenterY(H)) / focal_y, 1.0f};
 	float dir_norm = sqrt(dir_camera[0] * dir_camera[0] + dir_camera[1] * dir_camera[1] + dir_camera[2] * dir_camera[2]);
 	for (int dir_idx=0; dir_idx < 3; dir_idx++)
 		dir_camera[dir_idx] = dir_camera[dir_idx] / dir_norm;
@@ -256,7 +310,7 @@ __forceinline__ __device__ float3 calculate_rayt(const float* viewmatrix, const 
 }
 
 __forceinline__ __device__ float3 calculate_rayt(const float* viewmatrix, const float* cam_pos, const float* mean3D, const float focal_x, const float focal_y, const float* Rs, float2 pixf, float W, float H, bool filter_side) {
-	glm::vec3 dir_camera = {(pixf.x - (W-1.0) * 0.5) / focal_x, (pixf.y - (H-1.0) * 0.5) / focal_y, 1.0f};
+	glm::vec3 dir_camera = {(pixf.x - drkRayCenterX(W)) / focal_x, (pixf.y - drkRayCenterY(H)) / focal_y, 1.0f};
 	float dir_norm = sqrt(dir_camera[0] * dir_camera[0] + dir_camera[1] * dir_camera[1] + dir_camera[2] * dir_camera[2]);
 	for (int dir_idx=0; dir_idx < 3; dir_idx++)
 		dir_camera[dir_idx] = dir_camera[dir_idx] / dir_norm;

@@ -14,6 +14,39 @@ import torch.nn as nn
 import torch
 from . import _C
 
+def get_compiled_kernel_k():
+    return int(getattr(_C, "get_compiled_kernel_k", lambda: 8)())
+
+def get_compiled_low_pass_filter():
+    return bool(getattr(_C, "get_compiled_low_pass_filter", lambda: True)())
+
+def get_compiled_force_l1_kernel():
+    return bool(getattr(_C, "get_compiled_force_l1_kernel", lambda: False)())
+
+def get_compiled_force_acutance_one_kernel():
+    return bool(getattr(_C, "get_compiled_force_acutance_one_kernel", lambda: False)())
+
+def get_compiled_screen_space_l1_kernel():
+    return bool(getattr(_C, "get_compiled_screen_space_l1_kernel", lambda: False)())
+
+def get_compiled_tight_exact_aabb():
+    return bool(getattr(_C, "get_compiled_tight_exact_aabb", lambda: False)())
+
+def get_compiled_tight_exact_aabb_margin():
+    return float(getattr(_C, "get_compiled_tight_exact_aabb_margin", lambda: 2.0)())
+
+def get_compiled_pixel_center_offset_x():
+    return float(getattr(_C, "get_compiled_pixel_center_offset_x", lambda: 0.0)())
+
+def get_compiled_pixel_center_offset_y():
+    return float(getattr(_C, "get_compiled_pixel_center_offset_y", lambda: 0.0)())
+
+def get_compiled_pixel_center_offset_apply_projection():
+    return bool(getattr(_C, "get_compiled_pixel_center_offset_apply_projection", lambda: True)())
+
+def get_compiled_pixel_center_offset_apply_ray():
+    return bool(getattr(_C, "get_compiled_pixel_center_offset_apply_ray", lambda: True)())
+
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
@@ -34,6 +67,7 @@ def rasterize_gaussians(
     cache_sort,
     tile_culling,
     collect_densify,
+    render_aux,
     raster_settings,
 ):
     return _RasterizeGaussians.apply(
@@ -52,10 +86,11 @@ def rasterize_gaussians(
         cache_sort,
         tile_culling,
         collect_densify,
+        render_aux,
         raster_settings,
     )
 
-def rasterize_gaussians_forward(
+def make_rasterize_gaussians_forward_args(
     means3D,
     sh,
     colors_precomp,
@@ -67,9 +102,11 @@ def rasterize_gaussians_forward(
     acutances,
     cache_sort,
     tile_culling,
+    render_aux,
+    return_radii,
     raster_settings,
 ):
-    args = (
+    return (
         raster_settings.bg,
         means3D,
         colors_precomp,
@@ -92,10 +129,51 @@ def rasterize_gaussians_forward(
         raster_settings.prefiltered,
         cache_sort,
         tile_culling,
+        render_aux,
+        return_radii,
         raster_settings.debug,
     )
+
+
+def rasterize_gaussians_forward_from_args(args):
     num_rendered, color, depth, normal, alpha, radii, _, _, _ = _C.rasterize_gaussians(*args)
     return color, radii, depth, normal, alpha
+
+
+def rasterize_gaussians_forward(
+    means3D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    thetas,
+    l1l2_rates,
+    rotations,
+    acutances,
+    cache_sort,
+    tile_culling,
+    render_aux,
+    return_radii,
+    raster_settings,
+):
+    return rasterize_gaussians_forward_from_args(
+        make_rasterize_gaussians_forward_args(
+            means3D,
+            sh,
+            colors_precomp,
+            opacities,
+            scales,
+            thetas,
+            l1l2_rates,
+            rotations,
+            acutances,
+            cache_sort,
+            tile_culling,
+            render_aux,
+            return_radii,
+            raster_settings,
+        )
+    )
 
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
@@ -116,6 +194,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         cache_sort,
         tile_culling,
         collect_densify,
+        render_aux,
         raster_settings,
     ):
 
@@ -143,6 +222,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
             cache_sort,
             tile_culling,
+            render_aux,
+            True,
             raster_settings.debug
         )
 
@@ -165,6 +246,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.cache_sort = cache_sort
         ctx.tile_culling = tile_culling
         ctx.collect_densify = collect_densify
+        ctx.render_aux = render_aux
         # return color, radii
         return color, radii, depth, normal, alpha
 
@@ -245,6 +327,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             None
         )
 
@@ -282,7 +365,7 @@ class GaussianRasterizer(nn.Module):
 
         return visible
 
-    def forward(self, means3D, means2D, means2D_densify, opacity_densify, opacities, shs = None, colors_precomp = None, scales=None, thetas=None, l1l2_rates=None, rotations=None, acutances=None, cache_sort=False, tile_culling=False, collect_densify=True):
+    def forward(self, means3D, means2D, means2D_densify, opacity_densify, opacities, shs = None, colors_precomp = None, scales=None, thetas=None, l1l2_rates=None, rotations=None, acutances=None, cache_sort=False, tile_culling=False, collect_densify=True, render_aux=True):
 
         raster_settings = self.raster_settings
 
@@ -296,8 +379,32 @@ class GaussianRasterizer(nn.Module):
 
         if scales is None:
             scales = torch.Tensor([])
+        if thetas is None:
+            thetas = torch.Tensor([])
+        if l1l2_rates is None:
+            l1l2_rates = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
+        if acutances is None:
+            acutances = torch.Tensor([])
+
+        if scales.numel() > 0 or thetas.numel() > 0:
+            compiled_kernel_k = get_compiled_kernel_k()
+            if scales.numel() > 0 and scales.shape[-1] != compiled_kernel_k:
+                raise ValueError(
+                    f"DRK scales use K={scales.shape[-1]}, but the CUDA extension was compiled "
+                    f"with KERNEL_K={compiled_kernel_k}. Reinstall drk_splatting with "
+                    f"DRK_KERNEL_K={scales.shape[-1]}."
+                )
+            if thetas.numel() > 0 and thetas.shape[-1] != compiled_kernel_k:
+                raise ValueError(
+                    f"DRK thetas use K={thetas.shape[-1]}, but the CUDA extension was compiled "
+                    f"with KERNEL_K={compiled_kernel_k}. Reinstall drk_splatting with "
+                    f"DRK_KERNEL_K={thetas.shape[-1]}."
+                )
+
+        if torch.is_grad_enabled() and not render_aux:
+            raise ValueError("render_aux=False is only supported for no-grad inference")
 
         if not torch.is_grad_enabled():
             return rasterize_gaussians_forward(
@@ -312,6 +419,8 @@ class GaussianRasterizer(nn.Module):
                 acutances,
                 cache_sort,
                 tile_culling,
+                render_aux,
+                True,
                 raster_settings,
             )
 
@@ -332,5 +441,6 @@ class GaussianRasterizer(nn.Module):
             cache_sort,
             tile_culling,
             collect_densify,
+            render_aux,
             raster_settings,
         )

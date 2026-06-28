@@ -224,7 +224,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             norm_data = im_data / 255.0
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             arr = np.concatenate([arr, norm_data[:, :, 3:4]], axis=-1)
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGBA")
+            image = Image.fromarray(np.array(arr*255.0, dtype=np.uint8), "RGBA")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy 
@@ -302,7 +302,7 @@ def readCamerasFromNSVFPoses(path, idx, white_background, extension=".png", is_d
 
         norm_data = im_data / 255.0
         arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-        image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+        image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
 
         # given focal in pixel unit
         FovY = focal2fov(focal, image.size[1])

@@ -39,6 +39,47 @@ DRK with an updated densification strategy, compared to 3DGS on **Tanks & Temple
 
 ---
 
+## Real-time rendering via the traditional pipeline (web / mobile)
+
+A trained **soft-DRK** model can be rendered as a **triangle soup** by a standard hardware
+rasterization pipeline — each primitive becomes a billboard whose **fragment shader** evaluates the
+DRK radial kernel, composited with per-primitive depth sort + single-pass alpha blend. This runs in
+**WebGL2 / OpenGL ES** (web, mobile, headsets) with no CUDA dependency, while preserving the soft DRK
+appearance. `scripts/drk_soup_gl.py` is the reference renderer; `scripts/web/viewer.html` is a
+self-contained WebGL2 viewer.
+
+### Web / mobile deployment
+
+```bash
+# export a trained DRK model to a portable WebGL viewer folder (geometry + attributes + GLSL)
+python scripts/export_soup_web.py -m <run_dir> --load-iteration <N> --out viewer_out
+# view it — WebGL2 == the mobile GLES path, so in-browser FPS gauges on-device feasibility
+cd viewer_out && python3 -m http.server 8000   # open http://localhost:8000
+```
+
+Add `--embed` for a single double-click HTML, or `--skybox <asset_dir>` to composite a learned
+multi-shell background panorama behind the foreground. A ready-to-open example (50k-primitive
+Family soup + skybox, no server needed) is in [`demo/family_50k_viewer.html`](demo/family_50k_viewer.html)
+— open it in any browser (drag = orbit, scroll = zoom, slider = visible-primitive radius / FPS).
+
+### Comparison with 3DGS (same WebGL pipeline)
+
+Both methods rendered as billboard soups in the **same** pipeline (Tanks & Temples *Family*, test
+split, 896×512; FPS excludes offline read-back):
+
+| method | primitives | PSNR | FPS |
+|---|---|---|---|
+| 3DGS | 1.70 M | 21.5 | 116 |
+| **DRK (ours)** | **50 k** | 20.8 | **186** |
+| **DRK (ours)** | 150 k | 21.0 | 81 |
+
+DRK reaches comparable quality with **~11–34× fewer primitives** (3DGS collapses if subsampled),
+yielding a **~19× smaller asset** (≈21 MB vs ≈395 MB) and higher FPS at the low primitive counts
+mobile devices need. Reproduce with `scripts/gs_soup_gl.py` + `scripts/export_compare_web.py`
+(`scripts/web/compare.html` toggles DRK ⇄ 3DGS live).
+
+---
+
 ## Environment Setup
 
 ### Create and Activate Python Environment

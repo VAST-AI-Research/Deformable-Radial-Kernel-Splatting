@@ -27,6 +27,25 @@ MCMC_N_MAX = 51
 _MCMC_BINOMS = None
 
 
+def parse_drk_ply_metadata(plydata):
+    metadata = {}
+    for comment in getattr(plydata, "comments", []) or []:
+        parts = str(comment).strip().split(None, 1)
+        if len(parts) == 2 and parts[0].startswith("drk_"):
+            metadata[parts[0]] = parts[1]
+    return metadata
+
+
+def metadata_float(metadata, key):
+    value = metadata.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 def get_mcmc_binoms(device):
     global _MCMC_BINOMS
     if _MCMC_BINOMS is None or _MCMC_BINOMS.device != device:
@@ -644,6 +663,8 @@ class GaussianModel:
         self._xyz.add_(noise)
 
     def regularization_loss(self, **kwargs):
+        if not kwargs.get("include_base", True):
+            return 0.0
         loss = 0.0
         if self.mcmc_opacity_reg > 0.0:
             loss = loss + self.mcmc_opacity_reg * torch.abs(self.get_opacity).mean()
@@ -823,6 +844,20 @@ class DRKModel(GaussianModel):
         self.clone_only = False
         self.no_recenter = False
         self.no_resetopacity = False
+        self.keep_manual_densification_interval = False
+        self.keep_manual_opacity_reset_interval = False
+        self.init_scale_multiplier = 1.0
+        self.init_scale_quantile = 0.5
+        self.prune_big_screen_px = 0.0
+        self.prune_big_world_scale_k = 0.0
+        self.prune_big_from_iter = 0
+        self.prune_big_combine = 'or'
+        self.prune_big_ws_frac = 0.1
+        self.lambda_scale_size_reg = 0.0
+        self.scale_size_reg_target_k = 0.0
+        self.scale_size_reg_extent = 1.0
+        self.target_opacity_start = -1.0
+        self.opacity_target_ramp = 0
 
         self.cache_sort = False
         self.tile_culling = False
@@ -840,16 +875,84 @@ class DRKModel(GaussianModel):
         self.mcmc_scale_reg = 0.0
         self.mcmc_prune_min_opacity = 0.0
         self.mcmc_prune_score = "opacity"
+        self.lambda_acutance_target = 0.0
+        self.target_acutance = 1.0
+        self.target_acutance_start = -1.0
+        self.acutance_target_from_iter = 15000
+        self.acutance_target_until_iter = -1
+        self.acutance_target_warmup = 5000
+        self.acutance_target_ramp = 0
+        self.lambda_l1l2_target = 0.0
+        self.target_l1l2_rate = 1.0
+        self.target_l1l2_rate_start = -1.0
+        self.l1l2_target_from_iter = 15000
+        self.l1l2_target_until_iter = -1
+        self.l1l2_target_warmup = 5000
+        self.l1l2_target_ramp = 0
+        self.lambda_opacity_target = 0.0
+        self.target_opacity = 1.0
+        self.opacity_target_from_iter = 15000
+        self.opacity_target_until_iter = -1
+        self.opacity_target_warmup = 5000
+        self.opacity_target_l1l2_gate = 0.0
+        self.opacity_target_l1l2_gate_width = 0.05
+        self.opacity_binarize = 0.0          # >0 => push each prim to NEAREST extreme (0/1) about this threshold
+        self.opacity_prune_thresh = 0.0      # >0 => periodically prune prims with opacity < this
+        self._inference_cache_enabled = False
+        self._inference_cache_view_colors = False
+        self._inference_cache = None
 
     def train(self):
         self.training = True
+        self.enable_inference_cache(False)
         return self
     
     def eval(self):
         self.training = False
         return self
+
+    def enable_inference_cache(self, enabled=True, cache_view_colors=False):
+        self._inference_cache_enabled = bool(enabled)
+        self._inference_cache_view_colors = bool(cache_view_colors)
+        self.clear_inference_cache()
+        return self
+
+    def clear_inference_cache(self):
+        self._inference_cache = None
+        return self
+
+    @torch.no_grad()
+    def _build_inference_cache(self):
+        xyz = self.get_xyz.detach()
+        cache = {
+            "xyz": xyz,
+            "features": self.get_features.detach().contiguous(),
+            "opacity": self.get_opacity.detach().contiguous(),
+            "scaling": self.get_scaling.detach().contiguous(),
+            "rotation": self.get_rotation.detach().contiguous(),
+            "acutance": self.get_acutance.detach().contiguous(),
+            "thetas": self.get_thetas.detach().contiguous(),
+            "l1l2_rates": self.get_l1l2rates.detach().contiguous(),
+            "empty": xyz.new_empty((0,)),
+            "empty_xyz": xyz.new_empty((0, 3)),
+            "empty_opacity": xyz.new_empty((0, 1)),
+            "black_bg": torch.zeros((3,), dtype=torch.float32, device=xyz.device),
+            "raster_settings": {},
+            "raster_forward_args": {},
+        }
+        if self._inference_cache_view_colors:
+            cache["view_colors"] = {}
+        return cache
+
+    def get_inference_cache(self):
+        if not self._inference_cache_enabled or self.training:
+            return None
+        if self._inference_cache is None:
+            self._inference_cache = self._build_inference_cache()
+        return self._inference_cache
     
     def update(self, iteration):
+        self.clear_inference_cache()
         self.iteration = iteration
         if iteration in self.key_stages or (self.current_stage < len(self.key_stages)-1 and iteration > self.key_stages[self.current_stage+1]):
             if iteration in self.key_stages:
@@ -875,15 +978,117 @@ class DRKModel(GaussianModel):
                 print(f"Acutance update error: {torch.norm(current_acutance - new_acutance)} at iteration {iteration}!!!")
             # Reset other attributes
             self.scales_freedom         = self.scales_freedom_list[self.current_stage]
-            self.densification_interval = self.densification_interval_list[self.current_stage]
-            self.opacity_reset_interval = self.reset_opacity_interval_list[self.current_stage]
+            if not self.keep_manual_densification_interval:
+                self.densification_interval = self.densification_interval_list[self.current_stage]
+            if not self.keep_manual_opacity_reset_interval:
+                self.opacity_reset_interval = self.reset_opacity_interval_list[self.current_stage]
 
     @property
     def min_opacity_pruning(self):
         return self.final_min_opacity_pruning
 
+    def _scheduled_weight(self, base_weight, start_iter, until_iter, warmup):
+        if base_weight <= 0.0:
+            return 0.0
+        iteration = getattr(self, "iteration", 0)
+        if iteration < start_iter:
+            return 0.0
+        if until_iter is not None and until_iter >= 0 and iteration > until_iter:
+            return 0.0
+        if warmup > 0:
+            return base_weight * min(1.0, max(0.0, (iteration - start_iter + 1) / warmup))
+        return base_weight
+
+    def _scheduled_target(self, final_target, start_target, start_iter, ramp, min_value, max_value):
+        target = float(final_target)
+        if start_target is not None and start_target >= 0.0 and ramp > 0:
+            iteration = getattr(self, "iteration", 0)
+            alpha = min(1.0, max(0.0, (iteration - start_iter + 1) / ramp))
+            target = float(start_target) + (target - float(start_target)) * alpha
+        return min(max(target, min_value), max_value)
+
     def regularization_loss(self, **kwargs):
-        return super().regularization_loss(**kwargs)
+        loss = super().regularization_loss(**kwargs)
+        # One-sided world-scale hinge: penalize ONLY primitives larger than target_k*extent
+        # (unlike mcmc_scale_reg which L1-shrinks all scales uniformly and over-shrinks).
+        if self.lambda_scale_size_reg > 0 and self.scale_size_reg_target_k > 0 and self._scaling.numel() > 0:
+            size_target = self.scale_size_reg_target_k * float(getattr(self, 'scale_size_reg_extent', 1.0))
+            over = torch.clamp(self.get_scaling.max(dim=1).values - size_target, min=0.0)
+            if not torch.is_tensor(loss):
+                loss = torch.zeros((), dtype=self._xyz.dtype, device=self._xyz.device) + float(loss)
+            loss = loss + self.lambda_scale_size_reg * over.mean()
+        acutance_weight = self._scheduled_weight(
+            self.lambda_acutance_target,
+            self.acutance_target_from_iter,
+            self.acutance_target_until_iter,
+            self.acutance_target_warmup,
+        )
+        if acutance_weight > 0.0 and self._acutance.numel() > 0:
+            target = self._scheduled_target(
+                self.target_acutance,
+                self.target_acutance_start,
+                self.acutance_target_from_iter,
+                self.acutance_target_ramp,
+                self.acutance_min,
+                self.acutance_max,
+            )
+            target = torch.full_like(self.get_acutance, target)
+            loss = loss + acutance_weight * torch.square(self.get_acutance - target).mean()
+
+        l1l2_weight = self._scheduled_weight(
+            self.lambda_l1l2_target,
+            self.l1l2_target_from_iter,
+            self.l1l2_target_until_iter,
+            self.l1l2_target_warmup,
+        )
+        opacity_weight = self._scheduled_weight(
+            self.lambda_opacity_target,
+            self.opacity_target_from_iter,
+            self.opacity_target_until_iter,
+            self.opacity_target_warmup,
+        )
+        if acutance_weight <= 0.0 and l1l2_weight <= 0.0 and opacity_weight <= 0.0:
+            return loss
+
+        if not torch.is_tensor(loss):
+            loss = torch.zeros((), dtype=self._xyz.dtype, device=self._xyz.device) + float(loss)
+
+        if l1l2_weight > 0.0 and self._l1l2_rates.numel() > 0:
+            target = self._scheduled_target(
+                self.target_l1l2_rate,
+                self.target_l1l2_rate_start,
+                self.l1l2_target_from_iter,
+                self.l1l2_target_ramp,
+                0.0,
+                1.0,
+            )
+            target = torch.full_like(self.get_l1l2rates, target)
+            loss = loss + l1l2_weight * torch.square(self.get_l1l2rates - target).mean()
+        if opacity_weight > 0.0 and self._opacity.numel() > 0:
+            opacity = self.get_opacity
+            if self.opacity_binarize > 0.0:
+                # Binarize: push each primitive to its NEAREST extreme (0 or 1).
+                # Prims driven toward 0 become transparent and get pruned (opacity_prune_thresh);
+                # the rest become fully opaque -> directly mesh-convertible (no alpha blending).
+                target = (opacity.detach() >= float(self.opacity_binarize)).to(opacity.dtype)
+            else:
+                target = self._scheduled_target(
+                    self.target_opacity,
+                    self.target_opacity_start,
+                    self.opacity_target_from_iter,
+                    self.opacity_target_ramp,
+                    0.0,
+                    1.0,
+                )
+                target = torch.full_like(opacity, target)
+            opacity_error = torch.square(opacity - target)
+            if self.opacity_target_l1l2_gate > 0.0 and self._l1l2_rates.numel() > 0:
+                gate_start = min(max(float(self.opacity_target_l1l2_gate), 0.0), 1.0)
+                gate_width = max(float(self.opacity_target_l1l2_gate_width), 1e-6)
+                l1l2_gate = torch.clamp((self.get_l1l2rates.detach() - gate_start) / gate_width, 0.0, 1.0)
+                opacity_error = opacity_error * l1l2_gate
+            loss = loss + opacity_weight * opacity_error.mean()
+        return loss
     
     @property
     def get_acutance(self):
@@ -966,7 +1171,10 @@ class DRKModel(GaussianModel):
         self._acutance = nn.Parameter(acutances.requires_grad_(True))
         self._rotation.data = torch.randn_like(self._rotation)
         self._scaling = nn.Parameter(self._scaling[..., :1].expand(self._scaling.shape[0], self.kernel_K).clone())
-        self._scaling.data[:] = self._scaling[:, 0].median()
+        init_quantile = min(max(float(getattr(self, "init_scale_quantile", 0.5)), 0.0), 1.0)
+        init_multiplier = max(float(getattr(self, "init_scale_multiplier", 1.0)), 1e-8)
+        init_log_scale = torch.quantile(self._scaling[:, 0].detach(), init_quantile)
+        self._scaling.data[:] = init_log_scale + math.log(init_multiplier)
         self._thetas = nn.Parameter(torch.zeros_like(self._scaling))
         self._l1l2_rates = nn.Parameter(torch.zeros([self._thetas.shape[0], 1]).float().cuda())
 
@@ -994,6 +1202,8 @@ class DRKModel(GaussianModel):
         self.no_resetopacity = training_args.no_resetopacity
         self.densification_interval = training_args.densification_interval
         self.opacity_reset_interval = training_args.opacity_reset_interval
+        self.keep_manual_densification_interval = getattr(training_args, "keep_manual_densification_interval", False)
+        self.keep_manual_opacity_reset_interval = getattr(training_args, "keep_manual_opacity_reset_interval", False)
         self.percent_dense = training_args.percent_drk_dense
         self.use_mcmc = getattr(training_args, "use_mcmc", False)
         self.mcmc_strategy = getattr(training_args, "mcmc_strategy", "replace")
@@ -1009,6 +1219,38 @@ class DRKModel(GaussianModel):
         self.mcmc_scale_reg = getattr(training_args, "mcmc_scale_reg", 0.0)
         self.mcmc_prune_min_opacity = getattr(training_args, "mcmc_prune_min_opacity", 0.0)
         self.mcmc_prune_score = getattr(training_args, "mcmc_prune_score", "opacity")
+        self.prune_big_screen_px = getattr(training_args, 'prune_big_screen_px', 0.0)
+        self.prune_big_world_scale_k = getattr(training_args, 'prune_big_world_scale_k', 0.0)
+        self.prune_big_from_iter = getattr(training_args, 'prune_big_from_iter', 0)
+        self.prune_big_combine = getattr(training_args, 'prune_big_combine', 'or')
+        self.prune_big_ws_frac = getattr(training_args, 'prune_big_ws_frac', 0.1)
+        self.lambda_scale_size_reg = getattr(training_args, 'lambda_scale_size_reg', 0.0)
+        self.scale_size_reg_target_k = getattr(training_args, 'scale_size_reg_target_k', 0.0)
+        self.target_opacity_start = getattr(training_args, 'target_opacity_start', -1.0)
+        self.opacity_target_ramp = getattr(training_args, 'opacity_target_ramp', 0)
+        self.lambda_acutance_target = getattr(training_args, "lambda_acutance_target", 0.0)
+        self.target_acutance = getattr(training_args, "target_acutance", 1.0)
+        self.target_acutance_start = getattr(training_args, "target_acutance_start", -1.0)
+        self.acutance_target_from_iter = getattr(training_args, "acutance_target_from_iter", 15000)
+        self.acutance_target_until_iter = getattr(training_args, "acutance_target_until_iter", -1)
+        self.acutance_target_warmup = getattr(training_args, "acutance_target_warmup", 5000)
+        self.acutance_target_ramp = getattr(training_args, "acutance_target_ramp", 0)
+        self.lambda_l1l2_target = getattr(training_args, "lambda_l1l2_target", 0.0)
+        self.target_l1l2_rate = getattr(training_args, "target_l1l2_rate", 1.0)
+        self.target_l1l2_rate_start = getattr(training_args, "target_l1l2_rate_start", -1.0)
+        self.l1l2_target_from_iter = getattr(training_args, "l1l2_target_from_iter", 15000)
+        self.l1l2_target_until_iter = getattr(training_args, "l1l2_target_until_iter", -1)
+        self.l1l2_target_warmup = getattr(training_args, "l1l2_target_warmup", 5000)
+        self.l1l2_target_ramp = getattr(training_args, "l1l2_target_ramp", 0)
+        self.lambda_opacity_target = getattr(training_args, "lambda_opacity_target", 0.0)
+        self.target_opacity = getattr(training_args, "target_opacity", 1.0)
+        self.opacity_target_from_iter = getattr(training_args, "opacity_target_from_iter", 15000)
+        self.opacity_target_until_iter = getattr(training_args, "opacity_target_until_iter", -1)
+        self.opacity_target_warmup = getattr(training_args, "opacity_target_warmup", 5000)
+        self.opacity_target_l1l2_gate = getattr(training_args, "opacity_target_l1l2_gate", 0.0)
+        self.opacity_target_l1l2_gate_width = getattr(training_args, "opacity_target_l1l2_gate_width", 0.05)
+        self.opacity_binarize = getattr(training_args, "opacity_binarize", 0.0)
+        self.opacity_prune_thresh = getattr(training_args, "opacity_prune_thresh", 0.0)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.opacity_gradient_accum = torch.zeros_like(self.xyz_gradient_accum)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1032,6 +1274,20 @@ class DRKModel(GaussianModel):
         if training_args.specified_acu_range:
             acu_min, acu_max = training_args.specified_acu_min, training_args.specified_acu_max
             self.acutance_interval_list = [[acu_min, acu_max], [acu_min, acu_max], [acu_min, acu_max], [acu_min, acu_max]]
+            if self._acutance.numel() > 0:
+                current_acutance = self.get_acutance.detach()
+            else:
+                current_acutance = None
+            self.acutance_min, self.acutance_max = self.acutance_interval_list[max(self.current_stage, 0)]
+            self.acutance_activation = get_range_activation(self.acutance_min, self.acutance_max)
+            self.inv_acutance_activation = get_range_inv_activation(self.acutance_min, self.acutance_max)
+            if current_acutance is not None:
+                eps = torch.finfo(current_acutance.dtype).eps
+                normalized = (current_acutance - self.acutance_min) / (self.acutance_max - self.acutance_min)
+                near_boundary = (normalized <= eps * 16.0) | (normalized >= 1.0 - eps * 16.0)
+                normalized = normalized.clamp(eps, 1.0 - eps)
+                normalized = torch.where(near_boundary, torch.full_like(normalized, 0.5), normalized)
+                self._acutance.data = inverse_sigmoid(normalized)
             print(f"Using specified acutance range: {acu_min}, {acu_max}")
 
         self.prune_threshold = prune_threshold[training_args.kernel_density]
@@ -1306,10 +1562,43 @@ class DRKModel(GaussianModel):
             if extent == 0.0:
                 extent = 1e2
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            big_points_ws = self.get_scaling.max(dim=1).values > getattr(self, 'prune_big_ws_frac', 0.1) * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if getattr(self, 'iteration', 0) >= getattr(self, 'prune_big_from_iter', 0):
+            prune_mask = torch.logical_or(prune_mask, self.prune_large_primitives(extent, return_mask=True))
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def prune_large_primitives(self, extent, screen_px=None, world_scale_k=None,
+                               combine=None, return_mask=False):
+        """Prune non-physical over-large primitives (screen radii and/or world scale).
+        Works for any densify strategy (MCMC included) when called standalone."""
+        if screen_px is None:     screen_px = getattr(self, 'prune_big_screen_px', 0.0)
+        if world_scale_k is None: world_scale_k = getattr(self, 'prune_big_world_scale_k', 0.0)
+        if combine is None:       combine = getattr(self, 'prune_big_combine', 'or')
+        if extent is None or extent <= 0.0:
+            extent = 1e2
+        n = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        screen_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        world_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        use_screen = bool(screen_px) and screen_px > 0 and self.max_radii2D.shape[0] == n
+        use_world = bool(world_scale_k) and world_scale_k > 0
+        if use_screen:
+            screen_mask = self.max_radii2D > float(screen_px)
+        if use_world:
+            world_mask = self.get_scaling.max(dim=1).values > float(world_scale_k) * extent
+        if combine == 'and' and use_screen and use_world:
+            prune_mask = torch.logical_and(screen_mask, world_mask)
+        else:
+            prune_mask = torch.logical_or(screen_mask, world_mask)
+        if return_mask:
+            return prune_mask
+        pruned = int(prune_mask.sum())
+        if 0 < pruned < n:
+            self.prune_points(prune_mask)
+        return pruned
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -1350,10 +1639,26 @@ class DRKModel(GaussianModel):
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, acutances, scale, rotation, theta, l1l2rate), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
-        PlyData([el]).write(path)
+        PlyData(
+            [el],
+            comments=[
+                f"drk_kernel_K {int(self.kernel_K)}",
+                f"drk_acutance_min {float(self.acutance_min):.9g}",
+                f"drk_acutance_max {float(self.acutance_max):.9g}",
+                "drk_l1l2_rate_activation sigmoid",
+            ],
+        ).write(path)
 
     def load_ply(self, path):
         plydata = PlyData.read(path)
+        metadata = parse_drk_ply_metadata(plydata)
+        acutance_min = metadata_float(metadata, "drk_acutance_min")
+        acutance_max = metadata_float(metadata, "drk_acutance_max")
+        if acutance_min is not None and acutance_max is not None and acutance_min < acutance_max:
+            self.acutance_interval_list = [[acutance_min, acutance_max] for _ in self.acutance_interval_list]
+            self.acutance_min, self.acutance_max = acutance_min, acutance_max
+            self.acutance_activation = get_range_activation(self.acutance_min, self.acutance_max)
+            self.inv_acutance_activation = get_range_inv_activation(self.acutance_min, self.acutance_max)
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
@@ -1412,3 +1717,4 @@ class DRKModel(GaussianModel):
 
         self.active_sh_degree = self.max_sh_degree
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.clear_inference_cache()

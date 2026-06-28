@@ -39,6 +39,8 @@ RasterizeGaussiansCUDA(
 	const bool prefiltered,
 	const bool cache_sort,
 	const bool tile_culling,
+	const bool render_aux,
+	const bool return_radii,
 	const bool debug);
 
 

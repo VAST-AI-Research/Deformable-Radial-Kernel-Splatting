@@ -52,8 +52,9 @@ def loadCam(args, id, cam_info, resolution_scale):
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None
 
-    if np.asarray(cam_info.image).shape[-1] == 4:
-        loaded_mask = torch.from_numpy(np.asarray(cam_info.image)[..., -1:]).float().permute(2, 0, 1) / 255.
+    image_array = np.asarray(cam_info.image)
+    if image_array.shape[-1] == 4:
+        loaded_mask = torch.from_numpy(image_array[..., -1:].copy()).float().permute(2, 0, 1) / 255.
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 

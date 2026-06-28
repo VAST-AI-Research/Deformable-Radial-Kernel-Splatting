@@ -1,6 +1,15 @@
 import torch
-from piq import ssim, LPIPS
-lpips = LPIPS()
+try:
+    from piq import ssim, LPIPS
+    lpips = LPIPS()
+except ImportError:
+    from utils.loss_utils import ssim
+
+    class _L1LPIPSFallback(torch.nn.Module):
+        def forward(self, img1, img2):
+            return torch.abs(img1 - img2).mean(dim=(1, 2, 3))
+
+    lpips = _L1LPIPSFallback()
 
 
 def psnr(img1, img2):

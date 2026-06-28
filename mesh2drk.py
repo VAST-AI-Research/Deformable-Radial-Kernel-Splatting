@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import numpy as np
 from PIL import Image
@@ -61,34 +62,42 @@ def parse_obj(obj_filename, materials):
     return np.array(vertices), faces, uvs
 
 def calculate_face_color(face, uvs, materials, material_name, texture_img=None):
-    if texture_img:
+    if texture_img and len(face[1]) > 0:
         uv_coords = [uvs[i] for i in face[1]]
-        colors = [texture_img.getpixel((uv[0] * texture_img.width, (1 - uv[1]) * texture_img.height)) for uv in uv_coords]
-        avg_color = np.mean(colors, axis=0) / 255
-    elif materials is None:
+        colors = []
+        for uv in uv_coords:
+            px = int(np.clip(uv[0], 0.0, 1.0) * (texture_img.width - 1))
+            py = int(np.clip(1.0 - uv[1], 0.0, 1.0) * (texture_img.height - 1))
+            colors.append(texture_img.getpixel((px, py))[:3])
+        avg_color = np.mean(colors, axis=0) / 255.0
+    elif materials is None or material_name not in materials:
         avg_color = np.array([0.5, 0.5, 0.5])
     else:
-        avg_color = materials[material_name]['Kd']
+        avg_color = materials[material_name].get('Kd', [0.5, 0.5, 0.5])
 
     return avg_color
 
-def load_texture_image(materials, material_name):
-    if materials is None:
+def load_texture_image(materials, material_name, base_dir):
+    if materials is None or material_name not in materials:
         return None
     if 'map_Kd' in materials[material_name]:
         texture_path = materials[material_name]['map_Kd']
-        return Image.open(os.path.join('/home/yihua/disk8T/siga2024/data/lowpoly/meshes', texture_path))
+        return Image.open(os.path.join(base_dir, texture_path)).convert("RGB")
     return None
 
 
 def process_obj_with_mtl(obj_filename, mtl_filename=None):
-    materials = parse_mtl(mtl_filename) if mtl_filename is not None else None
+    materials = parse_mtl(mtl_filename) if mtl_filename is not None and os.path.exists(mtl_filename) else None
     vertices, faces, uvs = parse_obj(obj_filename, materials)
 
     face_colors = []
+    texture_cache = {}
+    base_dir = os.path.dirname(os.path.abspath(obj_filename))
     for face in tqdm.tqdm(faces):
         material_name = face[2]
-        texture_img = load_texture_image(materials, material_name)
+        if material_name not in texture_cache:
+            texture_cache[material_name] = load_texture_image(materials, material_name, base_dir)
+        texture_img = texture_cache[material_name]
         color = calculate_face_color(face, uvs, materials, material_name, texture_img)
         face_colors.append(color)
     face_vertices = np.array([vertices[f[0]] for f in faces])
@@ -172,7 +181,7 @@ class MeshKernel(DRKModel):
         self._thetas = thetas
         self._rotations = rotations
         self._features_dc = RGB2SH(colors)[:, None]
-        self._features_rest = torch.zeros([xyz.shape[0], (self.max_sh_degree+1)**2-1, 3]).float().cuda()  # N, D, 3
+        self._features_rest = torch.zeros([means3D.shape[0], (self.max_sh_degree+1)**2-1, 3]).float().cuda()  # N, D, 3
     @property
     def get_xyz(self):
         return self._xyz
@@ -254,9 +263,20 @@ class ComposedKernel(DRKModel):
             return torch.cat([self.mesh_drk.get_features, self.recon_drk.get_features], dim=0)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert mesh triangles to DRK primitives and preview them.")
+    parser.add_argument("--scene-path", default="", help="Optional DRK point_cloud.ply to render with the mesh")
+    parser.add_argument("--mesh", nargs="+", default=["./meshes/dog.obj"], help="OBJ or PLY mesh paths")
+    parser.add_argument("--width", type=int, default=800)
+    parser.add_argument("--height", type=int, default=800)
+    parser.add_argument("--fov", type=float, default=45.0, help="Vertical/ horizontal GUI FOV in degrees")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    scene_path = 'THE-PATH-TO-DRK-CHECKPOINT/point_cloud.ply'
-    mesh_path_list = ['./meshes/dog.obj']
+    args = parse_args()
+    scene_path = args.scene_path
+    mesh_path_list = args.mesh
 
     drk = DRKModel(3)
     if os.path.exists(scene_path):
@@ -305,8 +325,8 @@ if __name__ == "__main__":
 
     compose_gs = ComposedKernel(3, mesh_gs, drk)
 
-    W, H = 800, 800
-    fov = 45 * torch.pi / 180
+    W, H = args.width, args.height
+    fov = args.fov * torch.pi / 180
     focal = W / 2 / np.tan(fov / 2)
 
     pp = torch.tensor((W/2, H/2)).cuda()

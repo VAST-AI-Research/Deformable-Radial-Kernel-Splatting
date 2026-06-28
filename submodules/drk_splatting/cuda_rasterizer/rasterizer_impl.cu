@@ -83,6 +83,8 @@ __global__ void duplicateWithKeys(
 	const float * rotations,
 	const float2* kernel_vecs,
 	const float2* points_xy_image,
+	const uint2* rect_mins,
+	const uint2* rect_maxs,
 	float W,
 	float H,
 	const uint32_t* offsets,
@@ -98,15 +100,14 @@ __global__ void duplicateWithKeys(
 
 	// Generate no key/value pair for invisible Gaussians
 	if (radii[idx] > 0)
-	{
-		// Find this Gaussian's offset in buffer for writing keys/values.
-		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-		uint2 rect_min, rect_max;
-		uint32_t left_tile_num = tiles_touched[idx];
+		{
+			// Find this Gaussian's offset in buffer for writing keys/values.
+			uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+			uint2 rect_min = rect_mins[idx];
+			uint2 rect_max = rect_maxs[idx];
+			uint32_t left_tile_num = tiles_touched[idx];
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
-		
-		// Project vertices of the kernel onto the image plane
+			// Project vertices of the kernel onto the image plane
 		float vert2d[KERNEL_K][2] = {0.f};
 		if(tile_culling) {
 			float3 vert_center_world = {means3D[3 * idx + 0], means3D[3 * idx + 1], means3D[3 * idx + 2]};
@@ -124,8 +125,8 @@ __global__ void duplicateWithKeys(
 				float3 vert_view = transformPoint4x3(vert_world, viewmatrix);
 				adjustVertView(vert_center_view, vert_view);
 				float safe_z = copysignf(0.0000001f + fabsf(vert_view.z), vert_view.z);
-				float w = vert_view.x / safe_z * focal_x + (W - 1) / 2.0f;
-				float h = vert_view.y / safe_z * focal_y + (H - 1) / 2.0f;
+				float w = vert_view.x / safe_z * focal_x + drkProjectionCenterX(W);
+				float h = vert_view.y / safe_z * focal_y + drkProjectionCenterY(H);
 				vert2d[ii][0] = w;
 				vert2d[ii][1] = h;
 			}
@@ -251,32 +252,61 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
+	return fromChunk(chunk, P, true);
+}
+
+CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P, bool store_backward_aux)
+{
 	GeometryState geom;
 	obtain(chunk, geom.depths, P, 128);
 	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
+	obtain(chunk, geom.rect_min, P, 128);
+	obtain(chunk, geom.rect_max, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
-	
-	obtain(chunk, geom.op, P * 3, 128);
+
+	if (store_backward_aux)
+		obtain(chunk, geom.op, P * 3, 128);
+	else
+		geom.op = nullptr;
 	obtain(chunk, geom.op_tu, P, 128);
 	obtain(chunk, geom.op_tv, P, 128);
 	obtain(chunk, geom.op_n, P, 128);
-	obtain(chunk, geom.op_cos_n, P, 128);
+	if (store_backward_aux)
+		obtain(chunk, geom.op_cos_n, P, 128);
+	else
+		geom.op_cos_n = nullptr;
+#if LOW_PASS_FILTER
+	obtain(chunk, geom.op_inv_cos_n, P, 128);
+#else
+	geom.op_inv_cos_n = nullptr;
+#endif
 	obtain(chunk, geom.kernel_vecs, P * KERNEL_K, 128);
+#if !DRK_FORCE_L1_KERNEL
+	obtain(chunk, geom.scale_inv2, P * KERNEL_K, 128);
+#else
+	geom.scale_inv2 = nullptr;
+#endif
+	obtain(chunk, geom.kernel_inv_delta, P * KERNEL_K, 128);
 
 	return geom;
 }
 
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
+	return fromChunk(chunk, N, N);
+}
+
+CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t contrib_count, size_t range_count)
+{
 	ImageState img;
-	obtain(chunk, img.n_contrib, N, 128);
-	obtain(chunk, img.ranges, N, 128);
+	obtain(chunk, img.n_contrib, contrib_count, 128);
+	obtain(chunk, img.ranges, range_count, 128);
 	return img;
 }
 
@@ -327,14 +357,15 @@ int CudaRasterizer::Rasterizer::forward(
 	bool cache_sort,
 	bool tile_culling,
 	int* radii,
+	bool render_aux,
 	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryState>(P);
+	size_t chunk_size = requiredGeometryState(P, render_aux);
 	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P, render_aux);
 
 	if (radii == nullptr)
 	{
@@ -344,10 +375,17 @@ int CudaRasterizer::Rasterizer::forward(
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	// Dynamically resize image-based auxiliary buffers during training
-	size_t img_chunk_size = required<ImageState>(width * height);
+	const size_t tile_count = tile_grid.x * tile_grid.y;
+
+	// RGB-only inference only needs per-tile ranges. Avoid reserving the
+	// per-pixel contribution buffer that is used by training/backward.
+	size_t img_chunk_size = render_aux
+		? required<ImageState>(width * height)
+		: requiredImageState(1, tile_count);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+	ImageState imgState = render_aux
+		? ImageState::fromChunk(img_chunkptr, width * height)
+		: ImageState::fromChunk(img_chunkptr, 1, tile_count);
 
 	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
 	{
@@ -381,13 +419,19 @@ int CudaRasterizer::Rasterizer::forward(
 
 			geomState.op,
 			geomState.op_tu,
-		geomState.op_tv,
-		geomState.op_n,
-		geomState.op_cos_n,
-		geomState.kernel_vecs,
+			geomState.op_tv,
+			geomState.op_n,
+			geomState.op_cos_n,
+			geomState.op_inv_cos_n,
+				geomState.kernel_vecs,
+				geomState.scale_inv2,
+				geomState.kernel_inv_delta,
+				geomState.rect_min,
+				geomState.rect_max,
 
-		prefiltered,
-		tile_culling
+			prefiltered,
+		tile_culling,
+		render_aux
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
@@ -416,10 +460,12 @@ int CudaRasterizer::Rasterizer::forward(
 		means3D,
 		geomState.tiles_touched,
 		focal_x,
-		focal_y, rotations,
-		geomState.kernel_vecs,
-		geomState.means2D,
-		(float) width, (float) height,
+			focal_y, rotations,
+			geomState.kernel_vecs,
+			geomState.means2D,
+			geomState.rect_min,
+			geomState.rect_max,
+			(float) width, (float) height,
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
@@ -474,7 +520,10 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.op_tv,
 		geomState.op_n,
 		geomState.op_cos_n,
+		geomState.op_inv_cos_n,
 		geomState.kernel_vecs,
+		geomState.scale_inv2,
+		geomState.kernel_inv_delta,
 
 		out_alpha,
 		imgState.n_contrib,
@@ -482,7 +531,8 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		out_depth,
 		out_normal,
-		cache_sort), debug)
+		cache_sort,
+		render_aux), debug)
 
 	return num_rendered;
 }

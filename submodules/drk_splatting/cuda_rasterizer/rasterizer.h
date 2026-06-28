@@ -50,6 +50,7 @@ namespace CudaRasterizer
 			bool cache_sort,
 			bool tile_culling,
 			int* radii = nullptr,
+			bool render_aux = true,
 			bool debug = false);
 		
 		static void backward(

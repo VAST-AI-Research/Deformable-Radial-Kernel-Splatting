@@ -63,6 +63,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 		{
 			float xx = x * x, yy = y * y, zz = z * z;
 			float xy = x * y, yz = y * z, xz = x * z;
+			float xyz = xy * z;
 
 			float dRGBdsh4 = SH_C2[0] * xy;
 			float dRGBdsh5 = SH_C2[1] * yz;
@@ -120,6 +121,55 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 					SH_C3[3] * sh[12] * 3.f * (2.f * zz - xx - yy) +
 					SH_C3[4] * sh[13] * 4.f * 2.f * xz +
 					SH_C3[5] * sh[14] * (xx - yy));
+
+				if (deg > 3)
+				{
+					float dRGBdsh16 = SH_C4[0] * xy * (xx - yy);
+					float dRGBdsh17 = SH_C4[1] * yz * (3.f * xx - yy);
+					float dRGBdsh18 = SH_C4[2] * xy * (7.f * zz - 1.f);
+					float dRGBdsh19 = SH_C4[3] * yz * (7.f * zz - 3.f);
+					float dRGBdsh20 = SH_C4[4] * (zz * (35.f * zz - 30.f) + 3.f);
+					float dRGBdsh21 = SH_C4[5] * xz * (7.f * zz - 3.f);
+					float dRGBdsh22 = SH_C4[6] * (xx - yy) * (7.f * zz - 1.f);
+					float dRGBdsh23 = SH_C4[7] * xz * (xx - 3.f * yy);
+					float dRGBdsh24 = SH_C4[8] * (xx * (xx - 3.f * yy) - yy * (3.f * xx - yy));
+					dL_dsh[16] = dRGBdsh16 * dL_dRGB;
+					dL_dsh[17] = dRGBdsh17 * dL_dRGB;
+					dL_dsh[18] = dRGBdsh18 * dL_dRGB;
+					dL_dsh[19] = dRGBdsh19 * dL_dRGB;
+					dL_dsh[20] = dRGBdsh20 * dL_dRGB;
+					dL_dsh[21] = dRGBdsh21 * dL_dRGB;
+					dL_dsh[22] = dRGBdsh22 * dL_dRGB;
+					dL_dsh[23] = dRGBdsh23 * dL_dRGB;
+					dL_dsh[24] = dRGBdsh24 * dL_dRGB;
+
+					dRGBdx += (
+						SH_C4[0] * sh[16] * y * (3.f * xx - yy) +
+						SH_C4[1] * sh[17] * 6.f * xyz +
+						SH_C4[2] * sh[18] * y * (7.f * zz - 1.f) +
+						SH_C4[5] * sh[21] * z * (7.f * zz - 3.f) +
+						SH_C4[6] * sh[22] * 2.f * x * (7.f * zz - 1.f) +
+						SH_C4[7] * sh[23] * z * (3.f * xx - 3.f * yy) +
+						SH_C4[8] * sh[24] * 4.f * x * (xx - 3.f * yy));
+
+					dRGBdy += (
+						SH_C4[0] * sh[16] * x * (xx - 3.f * yy) +
+						SH_C4[1] * sh[17] * z * (3.f * xx - 3.f * yy) +
+						SH_C4[2] * sh[18] * x * (7.f * zz - 1.f) +
+						SH_C4[3] * sh[19] * z * (7.f * zz - 3.f) +
+						SH_C4[6] * sh[22] * -2.f * y * (7.f * zz - 1.f) +
+						SH_C4[7] * sh[23] * -6.f * xyz +
+						SH_C4[8] * sh[24] * 4.f * y * (yy - 3.f * xx));
+
+					dRGBdz += (
+						SH_C4[1] * sh[17] * y * (3.f * xx - yy) +
+						SH_C4[2] * sh[18] * 14.f * xyz +
+						SH_C4[3] * sh[19] * y * (21.f * zz - 3.f) +
+						SH_C4[4] * sh[20] * 20.f * z * (7.f * zz - 3.f) +
+						SH_C4[5] * sh[21] * x * (21.f * zz - 3.f) +
+						SH_C4[6] * sh[22] * 14.f * z * (xx - yy) +
+						SH_C4[7] * sh[23] * x * (xx - 3.f * yy));
+				}
 			}
 		}
 	}
@@ -267,7 +317,7 @@ renderCUDA(
 	const float ddely_dy = 0.5 * H;
 
 	// Pre-compute ray direction
-	glm::vec3 dir_camera = {(pixf.x - (W - 1.0) * 0.5) / focal_x, (pixf.y - (H - 1.0) * .5) / focal_y, 1.0f};
+	glm::vec3 dir_camera = {(pixf.x - drkRayCenterX((float)W)) / focal_x, (pixf.y - drkRayCenterY((float)H)) / focal_y, 1.0f};
 	float dir_norm = sqrt(dir_camera[0] * dir_camera[0] + dir_camera[1] * dir_camera[1] + dir_camera[2] * dir_camera[2]);
 	for (int dir_idx=0; dir_idx < 3; dir_idx++)
 		dir_camera[dir_idx] = dir_camera[dir_idx] / dir_norm;

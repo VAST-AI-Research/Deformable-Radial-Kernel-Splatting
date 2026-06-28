@@ -31,10 +31,12 @@ namespace CudaRasterizer
 		size_t scan_size;
 		float* depths;
 		char* scanning_space;
-		bool* clamped;
-		int* internal_radii;
-		float2* means2D;
-		float* rgb;
+			bool* clamped;
+			int* internal_radii;
+			float2* means2D;
+			uint2* rect_min;
+			uint2* rect_max;
+			float* rgb;
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 
@@ -43,9 +45,13 @@ namespace CudaRasterizer
 		float* op_tv;
 		float* op_n;
 		float* op_cos_n;
+		float* op_inv_cos_n;
 		float2* kernel_vecs;
+		float* scale_inv2;
+		float* kernel_inv_delta;
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
+		static GeometryState fromChunk(char*& chunk, size_t P, bool store_backward_aux);
 	};
 
 	struct ImageState
@@ -53,6 +59,7 @@ namespace CudaRasterizer
 		uint2* ranges;
 		uint32_t* n_contrib;
 		static ImageState fromChunk(char*& chunk, size_t N);
+		static ImageState fromChunk(char*& chunk, size_t contrib_count, size_t range_count);
 	};
 
 	struct BinningState
@@ -67,11 +74,25 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
-	template<typename T> 
+	template<typename T>
 	size_t required(size_t P)
 	{
 		char* size = nullptr;
 		T::fromChunk(size, P);
+		return ((size_t)size) + 128;
+	}
+
+	inline size_t requiredImageState(size_t contrib_count, size_t range_count)
+	{
+		char* size = nullptr;
+		ImageState::fromChunk(size, contrib_count, range_count);
+		return ((size_t)size) + 128;
+	}
+
+	inline size_t requiredGeometryState(size_t P, bool store_backward_aux)
+	{
+		char* size = nullptr;
+		GeometryState::fromChunk(size, P, store_backward_aux);
 		return ((size_t)size) + 128;
 	}
 };

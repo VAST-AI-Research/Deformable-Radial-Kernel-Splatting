@@ -50,10 +50,16 @@ namespace FORWARD
 		float * op_tv,
 		float * op_n,
 		float * op_cos_n,
-		float2 * kernel_vecs,
+		float * op_inv_cos_n,
+			float2 * kernel_vecs,
+			float * scale_inv2,
+			float * kernel_inv_delta,
+			uint2* rect_min,
+			uint2* rect_max,
 
-		bool prefiltered,
-		bool tile_culling);
+			bool prefiltered,
+		bool tile_culling,
+		bool store_backward_aux);
 
 	// Main rasterization method.
 	void render(
@@ -80,7 +86,10 @@ namespace FORWARD
 		float * op_tv,
 		float * op_n,
 		const float * op_cos_n,
+		const float * op_inv_cos_n,
 		const float2 * kernel_vecs,
+		const float * scale_inv2,
+		const float * kernel_inv_delta,
 
 		float* final_T,
 		uint32_t* n_contrib,
@@ -88,7 +97,8 @@ namespace FORWARD
 		float* out_color,
 		float* out_depth,
 		float* out_normal,
-		bool cache_sort);
+		bool cache_sort,
+		bool render_aux);
 }
 
 

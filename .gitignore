@@ -21,3 +21,5 @@ scripts/family_compare.py
 
 # Local notes generated during optimization
 DRK_CUDA_OPTIMIZATION.md
+outputs/
+data
